@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import importlib
+import os
+from pathlib import Path
+import sys
 from typing import Optional, Tuple
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 
 
 @dataclass
@@ -33,10 +38,19 @@ def _to_bthwc_video(video: torch.Tensor) -> torch.Tensor:
     if video.ndim != 5:
         raise ValueError(f"Expected a 4D/5D video tensor, got shape {tuple(video.shape)}")
 
-    # Heuristic: DriveLaW commonly uses (B, C, T, H, W) with C in {3, 6}.
     if video.shape[1] in (3, 6):
         return video.permute(0, 2, 1, 3, 4).contiguous()
     return video.contiguous()
+
+
+def _normalize_rgb_clip(clip: torch.Tensor) -> torch.Tensor:
+    """Map common DriveLaW video ranges to the [0, 1] range expected by XVO."""
+    clip = clip.float()
+    if clip.numel() == 0:
+        return clip
+    if clip.min() < 0:
+        clip = (clip + 1.0) * 0.5
+    return clip.clamp_(0.0, 1.0)
 
 
 def build_drivelaw_idm_clip(
@@ -53,11 +67,6 @@ def build_drivelaw_idm_clip(
     Returns:
       clip: (B, T_total, C, H, W) using only real frames
       meta: semantic frame counts and effective fps
-
-    Notes:
-      - In the current DriveLaW Act path, history/future supervision is sampled at 2Hz.
-      - The training code later repeats the last future frame to satisfy latent padding, but the
-        semantic future supervision itself is still 8 real frames.
     """
     if history_video.ndim == 6:
         history_video = history_video.squeeze(2)
@@ -82,51 +91,152 @@ def build_drivelaw_idm_clip(
     return clip, meta
 
 
-class XVOPairBackbone(nn.Module):
+def _resolve_optional_path(path_like: Optional[str]) -> Optional[Path]:
+    if not path_like:
+        return None
+    return Path(path_like).expanduser().resolve()
+
+
+@contextmanager
+def _prepend_python_path(path: Path):
+    path_str = str(path)
+    sys.path.insert(0, path_str)
+    try:
+        yield
+    finally:
+        try:
+            sys.path.remove(path_str)
+        except ValueError:
+            pass
+
+
+def _load_checkpoint_state(path: Path) -> dict:
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            checkpoint = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            checkpoint = checkpoint["state_dict"]
+    return checkpoint
+
+
+class ExternalXVOPairBackbone(nn.Module):
     """
-    XVO-style pair encoder adapted for a full video clip.
+    XVO pair encoder that reuses the original XVO backbone as directly as possible.
 
-    Original XVO consumes a pair of adjacent RGB frames concatenated along channels
-    (6-channel image). This module applies that idea to every adjacent pair in a clip:
+    Required external assets:
+      - XVO repo root (`XVO_ROOT` or `xvo_root`)
+      - MaskFlownet pretrained directory containing:
+          * `kitti.yaml`
+          * `8caNov12-1532_300000.pth`
+        (`XVO_FLOWNET_ROOT` or `flownet_root`)
 
-      (f0, f1), (f1, f2), ... , (f_{T-2}, f_{T-1})
-
-    Each pair is resized and encoded independently, yielding one token per pair.
+    Optional:
+      - Full XVO checkpoint (`XVO_CHECKPOINT_PATH` or `xvo_checkpoint_path`)
     """
 
     def __init__(
         self,
-        image_size: Tuple[int, int] = (224, 224),
-        embed_dim: int = 384,
-        backbone_name: str = "vit_small_patch16_224",
+        image_size: Tuple[int, int] = (384, 640),
+        embed_dim: int = 256,
+        xvo_root: Optional[str] = None,
+        flownet_root: Optional[str] = None,
+        xvo_checkpoint_path: Optional[str] = None,
+        freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
         self.image_size = image_size
-        self.backbone = timm.create_model(
-            backbone_name,
-            pretrained=False,
-            in_chans=6,
-            num_classes=0,
+        self.embed_dim = embed_dim
+        self.xvo_root = _resolve_optional_path(xvo_root or os.getenv("XVO_ROOT"))
+        self.flownet_root = _resolve_optional_path(flownet_root or os.getenv("XVO_FLOWNET_ROOT"))
+        self.xvo_checkpoint_path = _resolve_optional_path(
+            xvo_checkpoint_path or os.getenv("XVO_CHECKPOINT_PATH")
         )
-        self.proj = nn.Linear(self.backbone.num_features, embed_dim)
+
+        if self.xvo_root is None or not self.xvo_root.exists():
+            raise FileNotFoundError(
+                "XVO repo root not found. Set `xvo_root` or the `XVO_ROOT` environment variable."
+            )
+        if self.flownet_root is None or not self.flownet_root.exists():
+            raise FileNotFoundError(
+                "MaskFlownet pretrained directory not found. "
+                "Set `flownet_root` or the `XVO_FLOWNET_ROOT` environment variable."
+            )
+        if not (self.flownet_root / "kitti.yaml").exists():
+            raise FileNotFoundError(
+                f"Expected `{self.flownet_root / 'kitti.yaml'}` for XVO FlowNet initialization."
+            )
+
+        self.encoder, self.transformer, self.token_dim = self._build_external_backbone()
+        self.proj = nn.Identity() if self.token_dim == embed_dim else nn.Linear(self.token_dim, embed_dim)
+
+        if freeze_backbone:
+            self.freeze_backbone()
+
+    def _build_external_backbone(self) -> Tuple[nn.Module, nn.Module, int]:
+        with _prepend_python_path(self.xvo_root):
+            params_mod = importlib.import_module("params")
+            params_mod.par.pretrained_flownet_path = str(self.flownet_root)
+
+            vomodel_mod = importlib.import_module("model.vomodel")
+            VOModel = vomodel_mod.VOModel
+            model = VOModel()
+
+        self._load_pretrained_weights(model)
+        return model.encoder, model.transformer, 256
+
+    def _load_pretrained_weights(self, model: nn.Module) -> None:
+        model_dict = model.state_dict()
+        merged_state = dict(model_dict)
+
+        flownet_ckpt_path = self.flownet_root / "8caNov12-1532_300000.pth"
+        if flownet_ckpt_path.exists():
+            flownet_state = _load_checkpoint_state(flownet_ckpt_path)
+            flowed = {
+                f"encoder.maskflownet.{key}": value
+                for key, value in flownet_state.items()
+                if f"encoder.maskflownet.{key}" in model_dict
+                and model_dict[f"encoder.maskflownet.{key}"].shape == value.shape
+            }
+            merged_state.update(flowed)
+        else:
+            warnings.warn(
+                f"MaskFlownet checkpoint `{flownet_ckpt_path}` was not found. "
+                "The external XVO backbone will initialize without optical-flow pretraining."
+            )
+
+        if self.xvo_checkpoint_path is not None and self.xvo_checkpoint_path.exists():
+            xvo_state = _load_checkpoint_state(self.xvo_checkpoint_path)
+            cleaned_state = {}
+            for key, value in xvo_state.items():
+                clean_key = key[7:] if key.startswith("module.") else key
+                if clean_key in model_dict and model_dict[clean_key].shape == value.shape:
+                    cleaned_state[clean_key] = value
+            merged_state.update(cleaned_state)
+
+        model.load_state_dict(merged_state, strict=False)
+
+    def freeze_backbone(self) -> None:
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self) -> None:
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+        for param in self.transformer.parameters():
+            param.requires_grad = True
 
     def forward(self, clip: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-          clip: (B, T, C, H, W)
-
-        Returns:
-          pair_tokens: (B, T-1, D)
-        """
-        clip = _to_bthwc_video(clip)
+        clip = _normalize_rgb_clip(_to_bthwc_video(clip))
         bsz, timesteps, channels, _, _ = clip.shape
         if channels != 3:
             raise ValueError(f"Expected RGB clip with 3 channels, got {channels}")
         if timesteps < 2:
             raise ValueError(f"Need at least 2 frames, got {timesteps}")
 
-        pair_inputs = torch.cat([clip[:, :-1], clip[:, 1:]], dim=2)  # (B, T-1, 6, H, W)
-        pair_inputs = pair_inputs.flatten(0, 1)  # (B*(T-1), 6, H, W)
+        pair_inputs = torch.cat([clip[:, :-1], clip[:, 1:]], dim=2).flatten(0, 1)
         pair_inputs = F.interpolate(
             pair_inputs,
             size=self.image_size,
@@ -134,43 +244,52 @@ class XVOPairBackbone(nn.Module):
             align_corners=False,
         )
 
-        pair_feats = self.backbone.forward_features(pair_inputs)
-        if pair_feats.ndim == 3:
-            pair_feats = pair_feats.mean(dim=1)
+        pair_feats = self.encoder(pair_inputs)
+        pair_tokens = self.transformer(pair_feats)["feature"]
+        if pair_tokens.ndim == 3:
+            pair_tokens = pair_tokens.mean(dim=1)
 
-        pair_tokens = self.proj(pair_feats).view(bsz, timesteps - 1, -1)
-        return pair_tokens
+        return self.proj(pair_tokens).view(bsz, timesteps - 1, -1)
 
 
 class ReSimStyleIDM(nn.Module):
     """
     ReSim-style inverse dynamics module for DriveLaW.
 
-    Design:
-      1. Use an XVO-style adjacent-pair visual backbone to encode the clip.
-      2. Aggregate temporal motion tokens.
-      3. Use a lightweight attention head to decode all future waypoints at once.
+    The intended configuration is:
+      full clip -> original XVO backbone -> temporal attention head -> 8x3 waypoints
 
-    This follows the ReSim paper at the interface level:
-      full video clip -> XVO-style backbone -> attention head -> 8 future waypoints
+    This implementation requires the original XVO backbone and its pretrained
+    weights; there is no fallback encoder.
     """
 
     def __init__(
         self,
         num_waypoints: int = 8,
         waypoint_dim: int = 3,
-        embed_dim: int = 384,
+        embed_dim: int = 256,
         num_temporal_layers: int = 2,
-        num_heads: int = 6,
-        image_size: Tuple[int, int] = (224, 224),
+        num_heads: int = 4,
+        pair_image_size: Tuple[int, int] = (384, 640),
+        xvo_root: Optional[str] = None,
+        flownet_root: Optional[str] = None,
+        xvo_checkpoint_path: Optional[str] = None,
+        freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim={embed_dim} must be divisible by num_heads={num_heads}")
+
         self.num_waypoints = num_waypoints
         self.waypoint_dim = waypoint_dim
 
-        self.backbone = XVOPairBackbone(
-            image_size=image_size,
+        self.backbone = ExternalXVOPairBackbone(
+            image_size=pair_image_size,
             embed_dim=embed_dim,
+            xvo_root=xvo_root,
+            flownet_root=flownet_root,
+            xvo_checkpoint_path=xvo_checkpoint_path,
+            freeze_backbone=freeze_backbone,
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -201,14 +320,13 @@ class ReSimStyleIDM(nn.Module):
             nn.Linear(embed_dim, waypoint_dim),
         )
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-          clip: (B, T, C, H, W) or (B, C, T, H, W)
+    def freeze_backbone(self) -> None:
+        self.backbone.freeze_backbone()
 
-        Returns:
-          waypoints: (B, num_waypoints, waypoint_dim)
-        """
+    def unfreeze_backbone(self) -> None:
+        self.backbone.unfreeze_backbone()
+
+    def forward(self, clip: torch.Tensor) -> torch.Tensor:
         tokens = self.backbone(clip)
         tokens = self.temporal_encoder(tokens)
 
@@ -221,14 +339,24 @@ class ReSimStyleIDM(nn.Module):
 def build_resim_idm_for_drivelaw(
     num_waypoints: int = 8,
     waypoint_dim: int = 3,
+    xvo_root: Optional[str] = None,
+    flownet_root: Optional[str] = None,
+    xvo_checkpoint_path: Optional[str] = None,
+    freeze_backbone: bool = True,
 ) -> ReSimStyleIDM:
     """
-    Convenience factory aligned with the current DriveLaW action target format.
+    Factory aligned with the current DriveLaW target format.
 
-    Current DriveLaW trajectory targets are 8 future poses with 3 values each:
-      [x, y, heading]
+    This function requires XVO pretrained assets. Set either function arguments or:
+      - XVO_ROOT
+      - XVO_FLOWNET_ROOT
+      - XVO_CHECKPOINT_PATH  (optional)
     """
     return ReSimStyleIDM(
         num_waypoints=num_waypoints,
         waypoint_dim=waypoint_dim,
+        xvo_root=xvo_root,
+        flownet_root=flownet_root,
+        xvo_checkpoint_path=xvo_checkpoint_path,
+        freeze_backbone=freeze_backbone,
     )
