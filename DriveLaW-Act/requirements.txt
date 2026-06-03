@@ -52,6 +52,7 @@ pytorch-lightning
 tensorboard==2.16.2
 transformers
 protobuf==4.25.3
+pyiqa
 
 notebook
 timm

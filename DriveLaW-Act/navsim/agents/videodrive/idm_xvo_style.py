@@ -44,7 +44,7 @@ def _to_bthwc_video(video: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_rgb_clip(clip: torch.Tensor) -> torch.Tensor:
-    """Map common DriveLaW video ranges to the [0, 1] range expected by XVO."""
+    """XVO 的 ViT 需要0~1的 RGB 输入"""
     clip = clip.float()
     if clip.numel() == 0:
         return clip
@@ -89,6 +89,144 @@ def build_drivelaw_idm_clip(
         fps=2.0,
     )
     return clip, meta
+
+
+def angle_wrap(angle: torch.Tensor) -> torch.Tensor:
+    """Wrap angles to [-pi, pi] for stable yaw comparisons."""
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def compute_idm_consistency_reward(
+    pred_waypoints: torch.Tensor,
+    sampled_waypoints: torch.Tensor,
+    lambda_pos: float = 1.0,
+    lambda_yaw: float = 0.2,
+    time_weights: Optional[torch.Tensor] = None,
+    reduction: str = "none",
+) -> dict:
+    """
+    Compare IDM-predicted 8-point trajectories against sampled action trajectories.
+
+    Args:
+      pred_waypoints:   (B, T, 3)
+      sampled_waypoints:(B, T, 3)
+      lambda_pos:       position error weight
+      lambda_yaw:       yaw error weight
+      time_weights:     optional (T,) weights over the waypoint horizon
+      reduction:        one of {"none", "mean"}
+
+    Returns:
+      dict with:
+        - reward:   (B,) or scalar
+        - pos_error
+        - yaw_error
+        - total_cost
+    """
+    if pred_waypoints.shape != sampled_waypoints.shape:
+        raise ValueError(
+            "Predicted/sample trajectories must have identical shape, "
+            f"got {tuple(pred_waypoints.shape)} and {tuple(sampled_waypoints.shape)}"
+        )
+    if pred_waypoints.ndim != 3 or pred_waypoints.shape[-1] != 3:
+        raise ValueError(
+            f"Expected trajectories shaped (B, T, 3), got {tuple(pred_waypoints.shape)}"
+        )
+
+    pred_waypoints = pred_waypoints.float()
+    sampled_waypoints = sampled_waypoints.float()
+
+    pos_error_steps = torch.norm(
+        pred_waypoints[..., :2] - sampled_waypoints[..., :2],
+        dim=-1,
+    )
+    yaw_error_steps = angle_wrap(
+        pred_waypoints[..., 2] - sampled_waypoints[..., 2]
+    ).abs()
+
+    if time_weights is not None:
+        if time_weights.ndim != 1 or time_weights.shape[0] != pred_waypoints.shape[1]:
+            raise ValueError(
+                "time_weights must have shape (T,), "
+                f"got {tuple(time_weights.shape)} for T={pred_waypoints.shape[1]}"
+            )
+        weights = time_weights.to(pred_waypoints.device, pred_waypoints.dtype)
+        weights = weights / weights.sum().clamp_min(1e-8)
+        pos_error = (pos_error_steps * weights.unsqueeze(0)).sum(dim=-1)
+        yaw_error = (yaw_error_steps * weights.unsqueeze(0)).sum(dim=-1)
+    else:
+        pos_error = pos_error_steps.mean(dim=-1)
+        yaw_error = yaw_error_steps.mean(dim=-1)
+
+    total_cost = lambda_pos * pos_error + lambda_yaw * yaw_error
+    reward = -total_cost
+
+    if reduction == "mean":
+        reward = reward.mean()
+        pos_error = pos_error.mean()
+        yaw_error = yaw_error.mean()
+        total_cost = total_cost.mean()
+    elif reduction != "none":
+        raise ValueError(f"Unsupported reduction `{reduction}`")
+
+    return {
+        "reward": reward,
+        "pos_error": pos_error,
+        "yaw_error": yaw_error,
+        "total_cost": total_cost,
+    }
+
+
+def _normalize_frame_for_iqa(frame: torch.Tensor) -> torch.Tensor:
+    """Convert a frame to BCHW float tensor in [0, 1] for IQA models."""
+    if frame.ndim == 3:
+        frame = frame.unsqueeze(0)
+    if frame.ndim != 4:
+        raise ValueError(f"Expected frame tensor shaped (C,H,W) or (B,C,H,W), got {tuple(frame.shape)}")
+    frame = frame.float()
+    if frame.min() < 0:
+        frame = (frame + 1.0) * 0.5
+    return frame.clamp_(0.0, 1.0)
+
+
+def compute_musiq_reward(
+    future_video: torch.Tensor,
+    musiq_metric: nn.Module,
+    reduction: str = "none",
+) -> dict:
+    """
+    Reward 3: score only the middle frame and final frame with MUSIQ, then average.
+
+    Args:
+      future_video:  (B, T, C, H, W) or (B, C, T, H, W)
+      musiq_metric:  PyIQA MUSIQ module
+      reduction:     {"none", "mean"}
+    """
+    clip = _to_bthwc_video(future_video)
+    if clip.ndim != 5 or clip.shape[1] < 1:
+        raise ValueError(f"Expected future video shaped (B,T,C,H,W) with T>=1, got {tuple(clip.shape)}")
+
+    mid_index = clip.shape[1] // 2
+    last_index = clip.shape[1] - 1
+
+    mid_frame = _normalize_frame_for_iqa(clip[:, mid_index])
+    last_frame = _normalize_frame_for_iqa(clip[:, last_index])
+
+    mid_score = musiq_metric(mid_frame).reshape(-1)
+    last_score = musiq_metric(last_frame).reshape(-1)
+    reward = 0.5 * (mid_score + last_score)
+
+    if reduction == "mean":
+        reward = reward.mean()
+        mid_score = mid_score.mean()
+        last_score = last_score.mean()
+    elif reduction != "none":
+        raise ValueError(f"Unsupported reduction `{reduction}`")
+
+    return {
+        "reward": reward,
+        "mid_score": mid_score,
+        "last_score": last_score,
+    }
 
 
 def _resolve_optional_path(path_like: Optional[str]) -> Optional[Path]:

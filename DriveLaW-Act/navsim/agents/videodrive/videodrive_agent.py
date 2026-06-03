@@ -38,6 +38,11 @@ from einops import rearrange
 
 from .utils.model_utils import load_condition_models, load_latent_models, load_vae_models, load_diffusion_model, count_model_parameters, unwrap_model
 from .utils.model_loader import load_vae
+from .idm_xvo_style import (
+    build_drivelaw_idm_clip,
+    compute_idm_consistency_reward,
+    compute_musiq_reward,
+)
 # ----------------------------------------------------
 from torch.utils.tensorboard import SummaryWriter
 from .utils import init_logging, import_custom_class, save_video
@@ -90,6 +95,7 @@ class VideoDriveAgent(AbstractAgent):
         self.scheduler = None
 
         self.pipe = None
+        self.musiq_metric = None
 
         self.weight_dtype = torch.bfloat16
         self.device = "cuda" # device
@@ -103,6 +109,18 @@ class VideoDriveAgent(AbstractAgent):
 
     def name(self) -> str:
         return self.__class__.__name__
+
+    def _get_musiq_metric(self) -> torch.nn.Module:
+        if self.musiq_metric is None:
+            try:
+                import pyiqa
+            except ImportError as exc:
+                raise ImportError(
+                    "PyIQA is required for Reward 3. Install it with `pip install pyiqa`."
+                ) from exc
+            self.musiq_metric = pyiqa.create_metric("musiq").to(self.device)
+            self.musiq_metric.eval()
+        return self.musiq_metric
 
     def initialize(self) -> None:
         print("Initializing models")
@@ -250,85 +268,74 @@ class VideoDriveAgent(AbstractAgent):
             x_5d = torch.cat([x_5d, tail], dim=2)
         return x_5d
 
-    @torch.inference_mode()
-    def forward_test(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    @staticmethod
+    def _slice_feature_sample(features: Dict[str, torch.Tensor], index: int) -> Dict[str, torch.Tensor]:
+        sample = {}
+        for key, value in features.items():
+            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] > index:
+                sample[key] = value[index:index + 1]
+            else:
+                sample[key] = value
+        return sample
+
+    def _prepare_joint_infer_inputs(self, features: Dict[str, torch.Tensor]):
         device = self.device
         args = self.args
-        
         timing = {}
 
         if "images" not in features:
             raise ValueError("forward_test expects features['images'] = (T,C,H,W) conditioning frames.")
-        cond_tensor = features["images"]  # (T,3,H,W)
-        
+        cond_tensor = features["images"]
+
         if cond_tensor.ndim == 5:
+            if cond_tensor.shape[0] != 1:
+                raise ValueError(
+                    "sample_joint_rollouts expects a single sample; "
+                    "use `sample_joint_rollouts_batched` for batched features."
+                )
             cond_tensor = cond_tensor.squeeze(0)
         elif cond_tensor.ndim == 3:
             cond_tensor = cond_tensor.unsqueeze(0)
         elif cond_tensor.ndim != 4:
             raise ValueError(f"Expected cond_tensor (T,C,H,W), got shape {cond_tensor.shape}")
-        
-        T_cond, _, H_in, W_in = cond_tensor.shape
-        assert T_cond == 4
+
+        t_cond, _, _, _ = cond_tensor.shape
+        assert t_cond == 4
         weight_dtype = torch.bfloat16
 
-        # hist = features["history_trajectory"].to(torch.float32).squeeze(0)
-        # x0, y0, th0 = hist[0]         
-        # xT, yT, thT = hist[-1]        
-
-        # def _delta(a_last, a_first):
-        #     return float((a_last - a_first).item())
-
-        # dx_total = _delta(xT, x0)      
-        # dy_total = _delta(yT, y0)    
-        # dyaw_total = _delta(thT, th0) 
-
-        # total_forward = abs(float(x0.item()))    
-        # total_lateral = abs(float(y0.item()))
-        # net_yaw_change = abs(float(th0.item()))
-
-        # vel = features["vel"].squeeze(0)  # (2,)
-        # acc = features["acc"].squeeze(0)  # (2,)
-        # speed_mps = float(torch.linalg.norm(vel).item()) 
-        # acc_abs   = float(torch.linalg.norm(acc).item()) 
-
         context_dict = {
-                    "cmd_onehot": features["driving_command"].to(device, dtype=weight_dtype),
-                    "vel":        features["vel"].to(device, dtype=weight_dtype),
-                    "acc":        features["acc"].to(device, dtype=weight_dtype),
-                }
+            "cmd_onehot": features["driving_command"].to(device, dtype=weight_dtype),
+            "vel": features["vel"].to(device, dtype=weight_dtype),
+            "acc": features["acc"].to(device, dtype=weight_dtype),
+        }
 
         prompt = (
-            f"A high-quality, photorealistic dashboard camera view of autonomous driving. "
-            f"Based on the past 2 seconds videos, "
-            f"predict and generate the next 4 seconds of realistic driving continuation, "
-            f"Maintain temporal consistency, stable camera perspective, natural motion flow without jitter or artifacts, "
-            f"clear details, and realistic physics. "
+            "A high-quality, photorealistic dashboard camera view of autonomous driving. "
+            "Based on the past 2 seconds videos, "
+            "predict and generate the next 4 seconds of realistic driving continuation, "
+            "Maintain temporal consistency, stable camera perspective, natural motion flow without jitter or artifacts, "
+            "clear details, and realistic physics. "
         )
-        
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         cond_pils: List[Image.Image] = self._tensor_video_to_pils(cond_tensor)
         torch.cuda.synchronize()
-        timing['image_preprocessing'] = time.perf_counter() - t0
-        
+        timing["image_preprocessing"] = time.perf_counter() - t0
 
-        # height = int(getattr(args, "height", H_in))
-        # width  = int(getattr(args, "width",  W_in))
-        # height, width = self.round_to_vae_resolution(height, width)
-
-        num_frames = int(getattr(args, "num_frames", T_cond))
-        num_steps  = int(getattr(args, "num_inference_step", 20))
-        seed       = int(getattr(args, "seed", 42))
-        negative_prompt = getattr(args, "negative_prompt",
+        num_frames = int(getattr(args, "num_frames", 9))
+        num_steps = int(getattr(args, "num_inference_step", 20))
+        seed = int(getattr(args, "seed", 42))
+        negative_prompt = getattr(
+            args,
+            "negative_prompt",
             "worst quality, low quality, blurry, jittery, distorted, motion blur, ghosting, "
             "flickering, stuttering, camera shake, unstable footage, warping, trailing artifacts, "
-            "temporal inconsistency, jerky motion, choppy framerate"
+            "temporal inconsistency, jerky motion, choppy framerate",
         )
-        
-        action_chunk = int(getattr(args, "action_chunk",8))  
-        action_dim   = int(getattr(args, "action_dim", 3))                         
+
+        action_chunk = int(getattr(args, "action_chunk", 8))
+        action_dim = int(getattr(args, "action_dim", 3))
 
         if self.view_mode == "surround6":
             height, width = 256, 3072
@@ -340,55 +347,273 @@ class VideoDriveAgent(AbstractAgent):
                 width = int(args.width)
 
         condition = LTXVideoCondition(video=cond_pils, frame_index=0)
-        generator = torch.Generator(device=device).manual_seed(seed)
+        return {
+            "cond_tensor": cond_tensor,
+            "context_dict": context_dict,
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "num_frames": num_frames,
+            "num_steps": num_steps,
+            "seed": seed,
+            "action_chunk": action_chunk,
+            "action_dim": action_dim,
+            "height": height,
+            "width": width,
+            "condition": condition,
+            "timing": timing,
+        }
 
-       
+    def _postprocess_joint_rollout_outputs(
+        self,
+        cond_tensor: torch.Tensor,
+        preds: Dict[str, torch.Tensor],
+    ) -> Dict[str, object]:
+        actions = preds["actions"]
+        generated_video = preds["videos"]
+
+        final_action_clip_value = 1.0
+        if final_action_clip_value is not None:
+            actions = actions.clone()
+            actions.clamp_(-final_action_clip_value, final_action_clip_value)
+        actions = denorm_odo(actions).detach().float().cpu()  # (G, action_chunk, action_dim)
+
+        if not torch.is_tensor(generated_video):
+            raise TypeError(f"Expected generated video to be a tensor, got {type(generated_video)}")
+        generated_video = generated_video.detach().float().cpu()  # (G, F, C, H, W)
+        if generated_video.ndim != 5:
+            raise ValueError(f"Expected generated video shape (B,F,C,H,W), got {tuple(generated_video.shape)}")
+
+        future_frames_for_idm = min(8, generated_video.shape[1])
+        generated_future_video = generated_video[:, :future_frames_for_idm].contiguous()
+        if generated_future_video.shape[1] < 8:
+            pad = generated_future_video[:, -1:].repeat(1, 8 - generated_future_video.shape[1], 1, 1, 1)
+            generated_future_video = torch.cat([generated_future_video, pad], dim=1)
+
+        batch_size = generated_future_video.shape[0]
+        history_video = cond_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1).detach().float().cpu()
+        generated_future_video_bcthw = generated_future_video.permute(0, 2, 1, 3, 4).contiguous()
+        idm_clip, idm_meta = build_drivelaw_idm_clip(
+            history_video=history_video,
+            future_video=generated_future_video,
+        )
+
+        return {
+            "actions_tensor": actions,
+            "actions": actions.numpy(),
+            "generated_video": generated_video,
+            "generated_future_video": generated_future_video,
+            "generated_future_video_bcthw": generated_future_video_bcthw,
+            "idm_clip": idm_clip,
+            "idm_meta": idm_meta,
+        }
+
+    @torch.inference_mode()
+    def sample_joint_rollouts(
+        self,
+        features: Dict[str, torch.Tensor],
+        sample_time: int = 8,
+        seed: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """
+        Jointly sample `sample_time` action/video rollouts from the same conditioning input.
+
+        This is the GRPO-ready entry point for scheme A:
+          one pipe.infer call -> aligned actions + generated videos + IDM clips
+        """
+        device = self.device
+        infer_inputs = self._prepare_joint_infer_inputs(features)
+        timing = infer_inputs["timing"]
+
+        generator_seed = infer_inputs["seed"] if seed is None else int(seed)
+        generator = torch.Generator(device=device).manual_seed(generator_seed)
+
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         out = self.pipe.infer(
-            conditions=[condition],
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=10,
+            conditions=[infer_inputs["condition"]],
+            prompt=infer_inputs["prompt"],
+            negative_prompt=infer_inputs["negative_prompt"],
+            num_inference_steps=infer_inputs["num_steps"],
             guidance_scale=1.0,
-            height=height,
-            width=width,
+            height=infer_inputs["height"],
+            width=infer_inputs["width"],
             generator=generator,
-            num_frames=18,
-            output_type="latent", 
+            num_frames=infer_inputs["num_frames"],
+            num_videos_per_prompt=sample_time,
+            output_type="pt",
             return_action=True,
-            return_video=False,
-            action_chunk=action_chunk,   
-            action_dim=action_dim,
-            context_dict=context_dict,
-            noise_seed=42,
+            return_video=True,
+            action_chunk=infer_inputs["action_chunk"],
+            action_dim=infer_inputs["action_dim"],
+            context_dict=infer_inputs["context_dict"],
+            noise_seed=generator_seed,
             pixel_wise_timestep=True,
             image_cond_noise_scale=0.0,
         )
         torch.cuda.synchronize()
-        timing['pipe_infer'] = time.perf_counter() - t1
+        timing["pipe_infer"] = time.perf_counter() - t1
 
-        
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
         preds = out.frames if hasattr(out, "frames") else out
-        actions = preds["actions"] if isinstance(preds, dict) else preds[0]["action"]  # (B, action_chunk, action_dim)
-        final_action_clip_value = 1.0
-        if final_action_clip_value is not None:
-            actions.clamp_(-final_action_clip_value, final_action_clip_value)
-        actions = denorm_odo(actions)
+        rollout = self._postprocess_joint_rollout_outputs(infer_inputs["cond_tensor"], preds)
+        rollout["timing"] = timing
+        return rollout
 
-        actions = actions[0].detach().float().cpu()  # (action_chunk, action_dim)
-        torch.cuda.synchronize()
-        timing['action_postprocessing'] = time.perf_counter() - t2
-        
-        
-        self.last_inference_timing = timing
-        
-        
+    @torch.inference_mode()
+    def sample_joint_rollouts_batched(
+        self,
+        features: Dict[str, torch.Tensor],
+        sample_time: int = 8,
+        seed: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """
+        Batched wrapper over `sample_joint_rollouts`.
+
+        Returns tensors flattened over `(batch, group)` so they can be passed
+        directly to GRPO reward consumers expecting `(B * G, ...)`.
+        """
+        if "images" not in features or not torch.is_tensor(features["images"]):
+            raise ValueError("Expected batched `features['images']` tensor.")
+
+        images = features["images"]
+        if images.ndim == 4:
+            rollout = self.sample_joint_rollouts(features, sample_time=sample_time, seed=seed)
+            rollout["batch_size"] = 1
+            rollout["group_size"] = sample_time
+            return rollout
+        if images.ndim != 5:
+            raise ValueError(f"Expected images shaped (B,T,C,H,W) or (T,C,H,W), got {tuple(images.shape)}")
+
+        batch_size = images.shape[0]
+        rollouts = []
+        for batch_index in range(batch_size):
+            single_features = self._slice_feature_sample(features, batch_index)
+            single_seed = None if seed is None else int(seed) + batch_index
+            rollouts.append(
+                self.sample_joint_rollouts(single_features, sample_time=sample_time, seed=single_seed)
+            )
+
+        merged: Dict[str, object] = {
+            "actions_tensor": torch.cat([r["actions_tensor"] for r in rollouts], dim=0),
+            "actions": np.concatenate([r["actions"] for r in rollouts], axis=0),
+            "generated_video": torch.cat([r["generated_video"] for r in rollouts], dim=0),
+            "generated_future_video": torch.cat([r["generated_future_video"] for r in rollouts], dim=0),
+            "generated_future_video_bcthw": torch.cat(
+                [r["generated_future_video_bcthw"] for r in rollouts], dim=0
+            ),
+            "idm_clip": torch.cat([r["idm_clip"] for r in rollouts], dim=0),
+            "idm_meta": rollouts[0]["idm_meta"],
+            "batch_size": batch_size,
+            "group_size": sample_time,
+            "timing": [r["timing"] for r in rollouts],
+        }
+        return merged
+
+    @torch.inference_mode()
+    def compute_idm_reward(
+        self,
+        idm_model: torch.nn.Module,
+        rollout: Dict[str, object],
+        lambda_pos: float = 1.0,
+        lambda_yaw: float = 0.2,
+        time_weights: Optional[torch.Tensor] = None,
+        reduction: str = "none",
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute Reward 2 from a joint rollout:
+          generated video -> IDM -> 8 waypoints -> align with sampled actions
+        """
+        idm_clip = rollout["idm_clip"]
+        sampled_waypoints = rollout["actions_tensor"]
+
+        if not torch.is_tensor(idm_clip) or not torch.is_tensor(sampled_waypoints):
+            raise TypeError("rollout must contain tensor entries `idm_clip` and `actions_tensor`")
+
+        device = self.device
+        idm_clip = idm_clip.to(device)
+        sampled_waypoints = sampled_waypoints.to(device)
+
+        pred_waypoints = idm_model(idm_clip)
+        reward_dict = compute_idm_consistency_reward(
+            pred_waypoints=pred_waypoints,
+            sampled_waypoints=sampled_waypoints,
+            lambda_pos=lambda_pos,
+            lambda_yaw=lambda_yaw,
+            time_weights=time_weights,
+            reduction=reduction,
+        )
+        reward_dict["pred_waypoints"] = pred_waypoints
+        return reward_dict
+
+    @torch.inference_mode()
+    def compute_musiq_reward(
+        self,
+        rollout: Dict[str, object],
+        reduction: str = "none",
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute Reward 3 from a joint rollout:
+          generated future video -> MUSIQ(mid frame + last frame) / 2
+        """
+        future_video = rollout["generated_future_video"]
+        if not torch.is_tensor(future_video):
+            raise TypeError("rollout must contain tensor entry `generated_future_video`")
+
+        future_video = future_video.to(self.device)
+        return compute_musiq_reward(
+            future_video=future_video,
+            musiq_metric=self._get_musiq_metric(),
+            reduction=reduction,
+        )
+
+    @torch.inference_mode()
+    def compute_joint_reward_bundle(
+        self,
+        features: Dict[str, torch.Tensor],
+        idm_model: torch.nn.Module,
+        sample_time: int = 8,
+        seed: Optional[int] = None,
+        lambda_pos: float = 1.0,
+        lambda_yaw: float = 0.2,
+    ) -> Dict[str, object]:
+        """
+        High-level training entry helper:
+          batched features -> joint rollout -> Reward2/Reward3 tensors ready for GRPO.
+        """
+        rollout = self.sample_joint_rollouts_batched(
+            features=features,
+            sample_time=sample_time,
+            seed=seed,
+        )
+        idm_reward_dict = self.compute_idm_reward(
+            idm_model=idm_model,
+            rollout=rollout,
+            lambda_pos=lambda_pos,
+            lambda_yaw=lambda_yaw,
+            reduction="none",
+        )
+        musiq_reward_dict = self.compute_musiq_reward(
+            rollout=rollout,
+            reduction="none",
+        )
+        return {
+            "rollout": rollout,
+            "idm_reward_dict": idm_reward_dict,
+            "musiq_reward_dict": musiq_reward_dict,
+            "idm_rewards": idm_reward_dict["reward"],
+            "musiq_rewards": musiq_reward_dict["reward"],
+        }
+
+    @torch.inference_mode()
+    def forward_test(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        rollout = self.sample_joint_rollouts(features, sample_time=1)
+        self.last_inference_timing = rollout["timing"]
         result: Dict[str, object] = {
-            "actions": actions.numpy(),  
-            "actions_tensor": actions,   
+            "actions": rollout["actions"][0],
+            "actions_tensor": rollout["actions_tensor"][0],
+            "generated_future_video": rollout["generated_future_video"][0:1],
+            "generated_future_video_bcthw": rollout["generated_future_video_bcthw"][0:1],
+            "idm_clip": rollout["idm_clip"][0:1],
+            "idm_meta": rollout["idm_meta"],
         }
         return result
 
