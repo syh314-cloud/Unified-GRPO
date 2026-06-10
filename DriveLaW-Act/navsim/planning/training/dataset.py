@@ -259,8 +259,26 @@ class Dataset(torch.utils.data.Dataset):
                 """
             )
 
+        skipped_tokens = 0
         for token in tqdm(tokens_to_cache, desc="Caching Dataset"):
-            self._cache_scene_with_token(token)
+            try:
+                self._cache_scene_with_token(token)
+            except Exception as exc:
+                skipped_tokens += 1
+                logger.warning(
+                    "Skipping token %s due to cache error (%s): %s",
+                    token,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        cached_tokens = len(tokens_to_cache) - skipped_tokens
+        logger.info(
+            "Caching finished: %d succeeded, %d skipped, %d total.",
+            cached_tokens,
+            skipped_tokens,
+            len(tokens_to_cache),
+        )
 
     def __len__(self) -> None:
         """
