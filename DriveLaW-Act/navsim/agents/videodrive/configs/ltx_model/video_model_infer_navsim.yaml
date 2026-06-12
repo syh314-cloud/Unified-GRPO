@@ -5,7 +5,7 @@ tracker_name: ltx_trainer
 view_mode: "front"   
 logging_dir: logs
 output_dir: PATH_TO_SAVE_LOGS_AND_CHECKPOINTS
-pretrained_model_name_or_path: /path/to/DriveLaW-Video
+pretrained_model_name_or_path: /data/home/scyb955/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video
 ###
 train_data_class_path: data/agibotworld_dataset.py
 train_data_class: AgiBotWorld
