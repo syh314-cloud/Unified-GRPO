@@ -1,9 +1,9 @@
 TRAIN_TEST_SPLIT=navtest
 export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
-export NUPLAN_MAPS_ROOT="/path/to/dataset/maps"
-export NAVSIM_EXP_ROOT="/path/to/DriveLaW-Act"
-export NAVSIM_DEVKIT_ROOT="/path/to/DriveLaW-Act"
-export OPENSCENE_DATA_ROOT="/path/to/dataset"
+export NUPLAN_MAPS_ROOT="/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset/maps"
+export NAVSIM_EXP_ROOT="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act"
+export NAVSIM_DEVKIT_ROOT="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act"
+export OPENSCENE_DATA_ROOT="/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset"
 CACHE_PATH=$NAVSIM_EXP_ROOT/metric_cache
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=0

@@ -4,8 +4,8 @@ report_to: none
 tracker_name: ltx_trainer
 view_mode: "front"   
 logging_dir: logs
-output_dir: PATH_TO_SAVE_LOGS_AND_CHECKPOINTS
-pretrained_model_name_or_path: /data/home/scyb955/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video
+output_dir: /data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act/exp
+pretrained_model_name_or_path: /data/home/scyb955/run/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video
 ###
 train_data_class_path: data/agibotworld_dataset.py
 train_data_class: AgiBotWorld
@@ -19,12 +19,12 @@ textenc_class_path: transformers
 textenc_class: T5EncoderModel
 vae_class_path: diffusers
 vae_class: AutoencoderKLLTXVideo
-diffusion_model_class_path: path/to/DriveLaW-Act/navsim/agents/videodrive/video_models/ltx_models/transformer_ltx.py
+diffusion_model_class_path: /data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act/navsim/agents/videodrive/video_models/ltx_models/transformer_ltx.py
 diffusion_model_class: LTXVideoTransformer3DModel
 diffusion_scheduler_class_path: diffusers
 diffusion_scheduler_class: FlowMatchEulerDiscreteScheduler
 
-pipeline_class_path: path/to/DriveLaW-Act/navsim/agents/videodrive/video_models/pipeline/pipeline_ltx_condition.py
+pipeline_class_path: /data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act/navsim/agents/videodrive/video_models/pipeline/pipeline_ltx_condition.py
 pipeline_class: LTXConditionPipeline
 
 # 
@@ -105,7 +105,7 @@ flow_mode_scale: 1.29
 pixel_wise_timestep: True
 
 diffusion_model:
-  model_path: /path/to/DriveLaW-Video/transformer/diffusion_pytorch_model.safetensors
+  model_path: /data/home/scyb955/run/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video/transformer/diffusion_pytorch_model.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
