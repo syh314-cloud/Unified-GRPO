@@ -14,7 +14,7 @@ import pytorch_lightning as pl
 from nuplan.planning.utils.multithreading.worker_pool import WorkerPool
 from nuplan.planning.utils.multithreading.worker_utils import worker_map
 
-from navsim.planning.training.dataset import Dataset
+from navsim.planning.training.dataset import Dataset, CACHE_REPORTS_DIRNAME
 from navsim.common.dataloader import SceneLoader
 from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.agents.abstract_agent import AbstractAgent
@@ -124,7 +124,9 @@ def main(cfg: DictConfig) -> None:
     }
     cache_path = Path(cfg.cache_path)
     cache_path.mkdir(parents=True, exist_ok=True)
-    summary_path = cache_path / "cache_skip_summary.json"
+    reports_dir = cache_path / CACHE_REPORTS_DIRNAME
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = reports_dir / "cache_skip_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

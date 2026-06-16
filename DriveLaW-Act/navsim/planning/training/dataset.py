@@ -15,6 +15,32 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractFea
 
 logger = logging.getLogger(__name__)
 
+CACHE_REPORTS_DIRNAME = "_cache_reports"
+
+
+def _collect_valid_cache_paths(
+    cache_path: Path,
+    feature_builders: List[AbstractFeatureBuilder],
+    target_builders: List[AbstractTargetBuilder],
+) -> Dict[str, Path]:
+    """Scan cache tree and return tokens with complete feature/target files."""
+    valid_cache_paths: Dict[str, Path] = {}
+
+    for log_path in cache_path.iterdir():
+        if not log_path.is_dir() or log_path.name == CACHE_REPORTS_DIRNAME:
+            continue
+        for token_path in log_path.iterdir():
+            if not token_path.is_dir():
+                continue
+            found_caches = [
+                (token_path / (builder.get_unique_name() + ".gz")).is_file()
+                for builder in feature_builders + target_builders
+            ]
+            if all(found_caches):
+                valid_cache_paths[token_path.name] = token_path
+
+    return valid_cache_paths
+
 
 def load_feature_target_from_pickle(path: Path) -> Dict[str, torch.Tensor]:
     """Helper function to load pickled feature/target from path."""
@@ -100,7 +126,11 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
 
         for log_name in tqdm(log_names, desc="Loading Valid Caches"):
             log_path = cache_path / log_name
+            if not log_path.is_dir():
+                continue
             for token_path in log_path.iterdir():
+                if not token_path.is_dir():
+                    continue
                 found_caches: List[bool] = []
                 for builder in feature_builders + target_builders:
                     data_dict_path = token_path / (builder.get_unique_name() + ".gz")
@@ -176,14 +206,9 @@ class Dataset(torch.utils.data.Dataset):
         valid_cache_paths: Dict[str, Path] = {}
 
         if (cache_path is not None) and cache_path.is_dir():
-            for log_path in cache_path.iterdir():
-                for token_path in log_path.iterdir():
-                    found_caches: List[bool] = []
-                    for builder in feature_builders + target_builders:
-                        data_dict_path = token_path / (builder.get_unique_name() + ".gz")
-                        found_caches.append(data_dict_path.is_file())
-                    if all(found_caches):
-                        valid_cache_paths[token_path.name] = token_path
+            valid_cache_paths = _collect_valid_cache_paths(
+                cache_path, feature_builders, target_builders
+            )
 
         return valid_cache_paths
     def load_token_cache(self, token: str) -> None:
@@ -304,7 +329,9 @@ class Dataset(torch.utils.data.Dataset):
             "skip_samples": skip_samples,
             "worker_pid": os.getpid(),
         }
-        report_path = self._cache_path / f"cache_skip_report_{os.getpid()}.json"
+        reports_dir = self._cache_path / CACHE_REPORTS_DIRNAME
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"cache_skip_report_{os.getpid()}.json"
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(self.cache_stats, f, indent=2)
 
