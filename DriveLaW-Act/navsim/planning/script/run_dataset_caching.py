@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
+from collections import Counter
+import json
 import logging
 import uuid
 import os
@@ -56,7 +58,7 @@ def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[
         cache_path=cfg.cache_path,
         force_cache_computation=cfg.force_cache_computation,
     )
-    return []
+    return dataset.cache_stats
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
@@ -92,7 +94,49 @@ def main(cfg: DictConfig) -> None:
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
 
-    _ = worker_map(worker, cache_features, data_points)
+    worker_results = worker_map(worker, cache_features, data_points)
+
+    total_succeeded = 0
+    total_skipped = 0
+    total_tokens = 0
+    skip_reasons: Counter = Counter()
+    skip_samples: List[Dict[str, str]] = []
+
+    for result in worker_results:
+        if not result:
+            continue
+        total_succeeded += int(result.get("succeeded", 0))
+        total_skipped += int(result.get("skipped", 0))
+        total_tokens += int(result.get("total", 0))
+        skip_reasons.update(result.get("skip_reasons", {}))
+        for sample in result.get("skip_samples", []):
+            if len(skip_samples) < 200:
+                skip_samples.append(sample)
+
+    summary = {
+        "tokens_expected": len(scene_loader),
+        "tokens_attempted": total_tokens,
+        "succeeded": total_succeeded,
+        "skipped": total_skipped,
+        "success_rate": round(total_succeeded / total_tokens, 4) if total_tokens else 0.0,
+        "skip_reasons": dict(skip_reasons),
+        "skip_samples": skip_samples,
+    }
+    cache_path = Path(cfg.cache_path)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    summary_path = cache_path / "cache_skip_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info("=" * 60)
+    logger.info("GLOBAL CACHE SUMMARY")
+    logger.info("  tokens attempted : %d", total_tokens)
+    logger.info("  succeeded        : %d", total_succeeded)
+    logger.info("  skipped          : %d", total_skipped)
+    logger.info("  success rate     : %.2f%%", 100.0 * summary["success_rate"])
+    logger.info("  skip reasons     : %s", dict(skip_reasons))
+    logger.info("  full report      : %s", summary_path)
+    logger.info("=" * 60)
     logger.info(f"Finished caching {len(scene_loader)} scenarios for training/validation dataset")
 
 

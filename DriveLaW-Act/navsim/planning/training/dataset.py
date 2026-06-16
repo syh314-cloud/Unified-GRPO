@@ -1,5 +1,7 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from collections import Counter
+import json
 import logging
 import pickle
 import gzip
@@ -152,6 +154,7 @@ class Dataset(torch.utils.data.Dataset):
         self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
             self._cache_path, feature_builders, target_builders
         )
+        self.cache_stats: Dict[str, Any] = {}
 
         if self._cache_path is not None and not is_decoder:
             self.cache_dataset()
@@ -260,24 +263,57 @@ class Dataset(torch.utils.data.Dataset):
             )
 
         skipped_tokens = 0
-        for token in tqdm(tokens_to_cache, desc="Caching Dataset"):
+        skip_reasons: Counter = Counter()
+        skip_samples: List[Dict[str, str]] = []
+        quiet = os.environ.get("NAVSIM_CACHE_QUIET", "1") == "1"
+        log_every = int(os.environ.get("NAVSIM_CACHE_LOG_EVERY", "500"))
+
+        iterator = tqdm(tokens_to_cache, desc="Caching Dataset", disable=quiet)
+        for token in iterator:
             try:
                 self._cache_scene_with_token(token)
             except Exception as exc:
                 skipped_tokens += 1
-                logger.warning(
-                    "Skipping token %s due to cache error (%s): %s",
-                    token,
-                    type(exc).__name__,
-                    exc,
-                )
+                reason = type(exc).__name__
+                skip_reasons[reason] += 1
+                if len(skip_samples) < 100:
+                    skip_samples.append(
+                        {"token": token, "error": reason, "message": str(exc)[:500]}
+                    )
+                if not quiet:
+                    logger.warning(
+                        "Skipping token %s due to cache error (%s): %s",
+                        token,
+                        reason,
+                        exc,
+                    )
+                elif skipped_tokens == 1 or skipped_tokens % log_every == 0:
+                    logger.info(
+                        "Cache skip progress: %d skipped so far (latest: %s, %s)",
+                        skipped_tokens,
+                        token,
+                        reason,
+                    )
 
         cached_tokens = len(tokens_to_cache) - skipped_tokens
+        self.cache_stats = {
+            "succeeded": cached_tokens,
+            "skipped": skipped_tokens,
+            "total": len(tokens_to_cache),
+            "skip_reasons": dict(skip_reasons),
+            "skip_samples": skip_samples,
+            "worker_pid": os.getpid(),
+        }
+        report_path = self._cache_path / f"cache_skip_report_{os.getpid()}.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(self.cache_stats, f, indent=2)
+
         logger.info(
-            "Caching finished: %d succeeded, %d skipped, %d total.",
+            "Caching finished: %d succeeded, %d skipped, %d total. Report: %s",
             cached_tokens,
             skipped_tokens,
             len(tokens_to_cache),
+            report_path,
         )
 
     def __len__(self) -> None:
