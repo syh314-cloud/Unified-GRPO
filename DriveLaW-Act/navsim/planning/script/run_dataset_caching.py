@@ -25,6 +25,41 @@ CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
 
 
+def _merge_cache_stats(into: Dict[str, Any], stats: Dict[str, Any]) -> None:
+    into["succeeded"] = into.get("succeeded", 0) + int(stats.get("succeeded", 0))
+    into["skipped"] = into.get("skipped", 0) + int(stats.get("skipped", 0))
+    into["total"] = into.get("total", 0) + int(stats.get("total", 0))
+    for reason, count in stats.get("skip_reasons", {}).items():
+        into.setdefault("skip_reasons", Counter())[reason] += int(count)
+    for sample in stats.get("skip_samples", []):
+        samples = into.setdefault("skip_samples", [])
+        if len(samples) < 200:
+            samples.append(sample)
+
+
+def _aggregate_cache_reports(reports_dir: Path) -> Dict[str, Any]:
+    totals: Dict[str, Any] = {
+        "succeeded": 0,
+        "skipped": 0,
+        "total": 0,
+        "skip_reasons": Counter(),
+        "skip_samples": [],
+    }
+    if not reports_dir.is_dir():
+        return totals
+
+    for report_file in sorted(reports_dir.glob("cache_skip_report_*.json")):
+        try:
+            with open(report_file, encoding="utf-8") as f:
+                stats = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Skipping unreadable cache report %s: %s", report_file, exc)
+            continue
+        if isinstance(stats, dict):
+            _merge_cache_stats(totals, stats)
+    return totals
+
+
 def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[Optional[Any]]:
     """
     Helper function to cache features and targets of learnable agent.
@@ -58,7 +93,8 @@ def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[
         cache_path=cfg.cache_path,
         force_cache_computation=cfg.force_cache_computation,
     )
-    return dataset.cache_stats
+    # worker_map flattens list returns; a bare dict would be iterated by key (str).
+    return [dataset.cache_stats]
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
@@ -94,24 +130,19 @@ def main(cfg: DictConfig) -> None:
         for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
     ]
 
-    worker_results = worker_map(worker, cache_features, data_points)
+    worker_map(worker, cache_features, data_points)
 
-    total_succeeded = 0
-    total_skipped = 0
-    total_tokens = 0
-    skip_reasons: Counter = Counter()
-    skip_samples: List[Dict[str, str]] = []
+    cache_path = Path(cfg.cache_path)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    reports_dir = cache_path / CACHE_REPORTS_DIRNAME
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
-    for result in worker_results:
-        if not result:
-            continue
-        total_succeeded += int(result.get("succeeded", 0))
-        total_skipped += int(result.get("skipped", 0))
-        total_tokens += int(result.get("total", 0))
-        skip_reasons.update(result.get("skip_reasons", {}))
-        for sample in result.get("skip_samples", []):
-            if len(skip_samples) < 200:
-                skip_samples.append(sample)
+    aggregated = _aggregate_cache_reports(reports_dir)
+    total_succeeded = int(aggregated.get("succeeded", 0))
+    total_skipped = int(aggregated.get("skipped", 0))
+    total_tokens = int(aggregated.get("total", 0))
+    skip_reasons: Counter = aggregated.get("skip_reasons", Counter())
+    skip_samples: List[Dict[str, str]] = list(aggregated.get("skip_samples", []))
 
     summary = {
         "tokens_expected": len(scene_loader),
@@ -122,10 +153,6 @@ def main(cfg: DictConfig) -> None:
         "skip_reasons": dict(skip_reasons),
         "skip_samples": skip_samples,
     }
-    cache_path = Path(cfg.cache_path)
-    cache_path.mkdir(parents=True, exist_ok=True)
-    reports_dir = cache_path / CACHE_REPORTS_DIRNAME
-    reports_dir.mkdir(parents=True, exist_ok=True)
     summary_path = reports_dir / "cache_skip_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

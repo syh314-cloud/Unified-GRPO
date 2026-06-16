@@ -6,6 +6,7 @@ import logging
 import pickle
 import gzip
 import os
+import uuid
 
 import torch
 from tqdm import tqdm
@@ -331,7 +332,7 @@ class Dataset(torch.utils.data.Dataset):
         }
         reports_dir = self._cache_path / CACHE_REPORTS_DIRNAME
         reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path = reports_dir / f"cache_skip_report_{os.getpid()}.json"
+        report_path = reports_dir / f"cache_skip_report_{os.getpid()}_{uuid.uuid4().hex[:8]}.json"
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(self.cache_stats, f, indent=2)
 
