@@ -5,27 +5,28 @@ import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from hydra import compose, initialize
 from hydra.utils import instantiate
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from navsim.common.dataloader import SceneLoader
 from navsim.common.dataclasses import SensorConfig
+
+REPO_ROOT = Path(__file__).resolve().parent
+NAVTRAIN_SCENE_FILTER = (
+    REPO_ROOT / "navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml"
+)
 
 # ===== 按你的路径改 =====
 OPENSCENE = Path(os.environ.get(
     "OPENSCENE_DATA_ROOT",
     "/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset",
 ))
-OUT = Path("missing_cam_f0_report.json")
+OUT = REPO_ROOT / "missing_cam_f0_report.json"
+
 
 def main():
-    os.chdir(Path(__file__).resolve().parent)  # 若在子目录，改成 DriveLaW-Act 根目录
-
-    with initialize(config_path="navsim/planning/script/config", version_base=None):
-        cfg = compose(config_name="training/default_training", overrides=["train_test_split=navtrain"])
-
-    scene_filter = instantiate(cfg.train_test_split.scene_filter)
+    scene_filter = instantiate(OmegaConf.load(NAVTRAIN_SCENE_FILTER))
     sensor_config = SensorConfig.build_all_sensors(include=[0, 1, 2, 3])  # navtrain 4 帧 history
 
     loader = SceneLoader(
