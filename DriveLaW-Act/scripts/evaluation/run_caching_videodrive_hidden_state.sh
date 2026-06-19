@@ -6,7 +6,7 @@ export NAVSIM_DEVKIT_ROOT="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-
 export OPENSCENE_DATA_ROOT="/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset"
 # sensor/logs 直接用 HF 下载目录，避免再复制一份
 export SENSOR_BLOBS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_sensor_blobs/trainval"
-export NAVSIM_LOGS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs"
+export NAVSIM_LOGS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs/trainval"
 CACHE_PATH=$NAVSIM_EXP_ROOT/videodrive_agent_cache_dir_final_front
 
 export NCCL_DEBUG=WARN

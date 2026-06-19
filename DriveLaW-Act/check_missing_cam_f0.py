@@ -36,7 +36,7 @@ SENSOR_BLOBS_TRAINVAL = Path(os.environ.get(
 ))
 NAVSIM_LOGS_TRAINVAL = Path(os.environ.get(
     "NAVSIM_LOGS_TRAINVAL",
-    "/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs",
+    "/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs/trainval",
 ))
 OUT_DIR = Path(os.environ.get(
     "MISSING_CAM_F0_OUT_DIR",
