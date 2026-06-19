@@ -30,26 +30,45 @@ OPENSCENE = Path(os.environ.get(
     "OPENSCENE_DATA_ROOT",
     "/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset",
 ))
+SENSOR_BLOBS_TRAINVAL = Path(os.environ.get(
+    "SENSOR_BLOBS_TRAINVAL",
+    "/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_sensor_blobs/trainval",
+))
+NAVSIM_LOGS_TRAINVAL = Path(os.environ.get(
+    "NAVSIM_LOGS_TRAINVAL",
+    "/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs",
+))
 OUT_DIR = Path(os.environ.get(
     "MISSING_CAM_F0_OUT_DIR",
     str(REPO_ROOT / "missing_cam_f0_reports"),
 ))
 
+_SENSOR_PATH_MARKERS = (
+    "sensor_blobs/trainval/",
+    "trainval_sensor_blobs/trainval/",
+)
+
 
 def _rel_sensor_path(path: Path | str) -> str:
-    return str(path).split("sensor_blobs/trainval/")[-1]
+    s = str(path)
+    for marker in _SENSOR_PATH_MARKERS:
+        if marker in s:
+            return s.split(marker, 1)[-1]
+    return s
 
 
 def _extract_missing_path_from_error(exc: Exception) -> str | None:
     msg = str(exc)
-    if "sensor_blobs/trainval/" in msg:
-        return _rel_sensor_path(msg)
+    for marker in _SENSOR_PATH_MARKERS:
+        if marker in msg:
+            return _rel_sensor_path(msg)
     for line in msg.splitlines():
         line = line.strip()
         if re.match(r"^[123]\)", line):
             candidate = line.split(")", 1)[1].strip()
-            if "sensor_blobs/trainval/" in candidate:
-                return _rel_sensor_path(candidate)
+            for marker in _SENSOR_PATH_MARKERS:
+                if marker in candidate:
+                    return _rel_sensor_path(candidate)
     return None
 
 
@@ -157,8 +176,8 @@ def main():
     sensor_config = SensorConfig.build_all_sensors(include=CACHE_SENSOR_ITERS)
 
     loader = SceneLoader(
-        data_path=OPENSCENE / "navsim_logs" / "trainval",
-        sensor_blobs_path=OPENSCENE / "sensor_blobs" / "trainval",
+        data_path=NAVSIM_LOGS_TRAINVAL,
+        sensor_blobs_path=SENSOR_BLOBS_TRAINVAL,
         scene_filter=scene_filter,
         sensor_config=sensor_config,
         load_image_path=True,

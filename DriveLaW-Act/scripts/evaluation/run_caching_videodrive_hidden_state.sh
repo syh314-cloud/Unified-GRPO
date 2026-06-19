@@ -4,6 +4,9 @@ export NUPLAN_MAPS_ROOT="/data/home/scyb955/run/sunyuhan/navsim_workspace/datase
 export NAVSIM_EXP_ROOT="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act"
 export NAVSIM_DEVKIT_ROOT="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act"
 export OPENSCENE_DATA_ROOT="/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset"
+# sensor/logs 直接用 HF 下载目录，避免再复制一份
+export SENSOR_BLOBS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_sensor_blobs/trainval"
+export NAVSIM_LOGS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs"
 CACHE_PATH=$NAVSIM_EXP_ROOT/videodrive_agent_cache_dir_final_front
 
 export NCCL_DEBUG=WARN
@@ -21,4 +24,6 @@ torchrun --nproc_per_node=$RESOURCE_GPU \
     agent.config_file="/data/home/scyb955/run/sunyuhan/projects/SD/DriveLaW-Act/navsim/agents/videodrive/configs/ltx_model/video_model_infer_navsim.yaml" \
     experiment_name=videodrive_agent_cache \
     train_test_split=$TRAIN_TEST_SPLIT \
-    cache_path=$CACHE_PATH 
+    cache_path=$CACHE_PATH \
+    sensor_blobs_path=$SENSOR_BLOBS_TRAINVAL \
+    navsim_log_path=$NAVSIM_LOGS_TRAINVAL
