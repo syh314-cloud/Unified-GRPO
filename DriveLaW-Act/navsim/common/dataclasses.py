@@ -113,8 +113,6 @@ class Cameras:
             if camera_identifier in sensor_names:
                 image_path = sensor_blobs_path / camera_dict[camera_name]["data_path"]
                 if not load_image_path:
-                    if camera_identifier == 'cam_f0':
-                        print(image_path)
                     try:
                         img_np = np.array(Image.open(image_path).convert("RGB"))
                     except Exception:
@@ -517,11 +515,11 @@ class Scene:
                 load_image_path=load_image_path,
             )
 
-            # lidar = Lidar.from_paths(
-            #     sensor_blobs_path=sensor_blobs_path,
-            #     lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
-            #     sensor_names=sensor_names,
-            # )
+            lidar = Lidar.from_paths(
+                sensor_blobs_path=sensor_blobs_path,
+                lidar_path=Path(scene_dict_list[frame_idx]["lidar_path"]),
+                sensor_names=sensor_names,
+            )
 
             frame = Frame(
                 token=scene_dict_list[frame_idx]["token"],
@@ -530,7 +528,7 @@ class Scene:
                 traffic_lights=scene_dict_list[frame_idx]["traffic_lights"],
                 annotations=annotations,
                 ego_status=global_ego_status,
-                lidar=None,
+                lidar=lidar,
                 cameras=cameras,
             )
             frames.append(frame)
