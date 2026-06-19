@@ -25,6 +25,12 @@ CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
 
 
+def _agent_loads_image_paths(cfg: DictConfig) -> bool:
+    """VideoDrive caches image paths; most baselines need decoded sensor arrays."""
+    target = str(cfg.agent.get("_target_", ""))
+    return "videodrive" in target.lower()
+
+
 def _merge_cache_stats(into: Dict[str, Any], stats: Dict[str, Any]) -> None:
     into["succeeded"] = into.get("succeeded", 0) + int(stats.get("succeeded", 0))
     into["skipped"] = into.get("skipped", 0) + int(stats.get("skipped", 0))
@@ -71,6 +77,8 @@ def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[
     log_names = [a["log_file"] for a in args]
     tokens = [t for a in args for t in a["tokens"]]
     cfg: DictConfig = args[0]["cfg"]
+    load_image_path = _agent_loads_image_paths(cfg)
+    os.environ["NAVSIM_CACHE_ONLY"] = "1"
 
     agent: AbstractAgent = instantiate(cfg.agent)
 
@@ -82,7 +90,7 @@ def cache_features(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[
         data_path=Path(cfg.navsim_log_path),
         scene_filter=scene_filter,
         sensor_config=agent.get_sensor_config(),
-        load_image_path=True
+        load_image_path=load_image_path,
     )
     logger.info(f"Extracted {len(scene_loader.tokens)} scenarios for thread_id={thread_id}, node_id={node_id}.")
 
