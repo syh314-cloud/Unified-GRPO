@@ -9,6 +9,12 @@ export SENSOR_BLOBS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/n
 export NAVSIM_LOGS_TRAINVAL="/data/home/scyb955/run/sunyuhan/navsim_workspace/navsim/download/trainval_navsim_logs/trainval"
 CACHE_PATH=$NAVSIM_EXP_ROOT/videodrive_agent_cache_dir_final_front
 
+export RESOURCE_GPU=${RESOURCE_GPU:-1}
+export WORLD_SIZE=${WORLD_SIZE:-1}
+export RANK=${RANK:-0}
+export MASTER_ADDR=${MASTER_ADDR:-localhost}
+export MASTER_PORT=${MASTER_PORT:-29500}
+
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=0
 export NCCL_P2P_DISABLE=1
@@ -26,4 +32,5 @@ torchrun --nproc_per_node=$RESOURCE_GPU \
     train_test_split=$TRAIN_TEST_SPLIT \
     cache_path=$CACHE_PATH \
     sensor_blobs_path=$SENSOR_BLOBS_TRAINVAL \
-    navsim_log_path=$NAVSIM_LOGS_TRAINVAL
+    navsim_log_path=$NAVSIM_LOGS_TRAINVAL \
+    worker.ray_distributed_no_torch.threads_per_node=2
