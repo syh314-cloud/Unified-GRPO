@@ -395,6 +395,7 @@ class VideoDriveAgent(AbstractAgent):
         idm_clip, idm_meta = build_drivelaw_idm_clip(
             history_video=history_video,
             future_video=generated_future_video,
+            future_interval_s=self._trajectory_sampling.interval_length,
         )
 
         return {
@@ -523,16 +524,22 @@ class VideoDriveAgent(AbstractAgent):
           generated video -> IDM -> 8 waypoints -> align with sampled actions
         """
         idm_clip = rollout["idm_clip"]
+        idm_meta = rollout["idm_meta"]
         sampled_waypoints = rollout["actions_tensor"]
 
         if not torch.is_tensor(idm_clip) or not torch.is_tensor(sampled_waypoints):
             raise TypeError("rollout must contain tensor entries `idm_clip` and `actions_tensor`")
+        if idm_meta.future_frames != sampled_waypoints.shape[1]:
+            raise ValueError(
+                "IDM future frame count must match sampled trajectory horizon, "
+                f"got {idm_meta.future_frames} vs {sampled_waypoints.shape[1]}"
+            )
 
         device = self.device
         idm_clip = idm_clip.to(device)
         sampled_waypoints = sampled_waypoints.to(device)
 
-        pred_waypoints = idm_model(idm_clip)
+        pred_waypoints = idm_model(idm_clip, meta=idm_meta)
         reward_dict = compute_idm_consistency_reward(
             pred_waypoints=pred_waypoints,
             sampled_waypoints=sampled_waypoints,

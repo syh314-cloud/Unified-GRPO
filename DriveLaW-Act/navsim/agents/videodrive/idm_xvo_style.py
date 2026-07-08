@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
+import math
 import os
 from pathlib import Path
 import sys
@@ -56,6 +57,7 @@ def _normalize_rgb_clip(clip: torch.Tensor) -> torch.Tensor:
 def build_drivelaw_idm_clip(
     history_video: torch.Tensor,
     future_video: torch.Tensor,
+    future_interval_s: float = 0.5,
 ) -> Tuple[torch.Tensor, IDMClipMeta]:
     """
     Build the semantic IDM input clip for the current DriveLaW training path.
@@ -73,20 +75,15 @@ def build_drivelaw_idm_clip(
     if future_video.ndim == 6:
         future_video = future_video.squeeze(2)
 
-    hist = _to_bthwc_video(history_video)
     fut = _to_bthwc_video(future_video)
-
-    if hist.shape[0] != fut.shape[0] or hist.shape[2:] != fut.shape[2:]:
-        raise ValueError(
-            "History/future videos must share batch size and frame shape, "
-            f"got {tuple(hist.shape)} and {tuple(fut.shape)}"
-        )
-
-    clip = torch.cat([hist, fut], dim=1)
+    dt = float(future_interval_s)
+    if dt <= 0.0:
+        raise ValueError(f"future_interval_s must be positive, got {dt}")
+    clip = fut
     meta = IDMClipMeta(
-        history_frames=hist.shape[1],
+        history_frames=0,
         future_frames=fut.shape[1],
-        fps=2.0,
+        fps=1.0 / dt,
     )
     return clip, meta
 
@@ -94,6 +91,37 @@ def build_drivelaw_idm_clip(
 def angle_wrap(angle: torch.Tensor) -> torch.Tensor:
     """Wrap angles to [-pi, pi] for stable yaw comparisons."""
     return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def _build_sinusoidal_time_embedding(
+    *,
+    num_steps: int,
+    fps: float,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build fixed time embeddings for future queries q_k at k / fps seconds."""
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+    if fps <= 0.0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    if dim <= 0:
+        raise ValueError(f"dim must be positive, got {dim}")
+
+    times = torch.arange(1, num_steps + 1, device=device, dtype=torch.float32) / float(fps)
+    half_dim = dim // 2
+    if half_dim == 0:
+        return times.unsqueeze(-1).to(dtype=dtype)
+
+    freq_idx = torch.arange(half_dim, device=device, dtype=torch.float32)
+    freq_divisor = max(half_dim - 1, 1)
+    freq = torch.exp(-math.log(10000.0) * freq_idx / freq_divisor)
+    phase = times.unsqueeze(-1) * freq.unsqueeze(0)
+    embedding = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
+    if embedding.shape[-1] < dim:
+        embedding = F.pad(embedding, (0, dim - embedding.shape[-1]))
+    return embedding.to(dtype=dtype)
 
 
 def compute_idm_consistency_reward(
@@ -445,6 +473,11 @@ class ReSimStyleIDM(nn.Module):
         )
 
         self.waypoint_queries = nn.Parameter(torch.randn(1, num_waypoints, embed_dim) * 0.02)
+        self.query_time_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
         self.attn_head = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -464,11 +497,44 @@ class ReSimStyleIDM(nn.Module):
     def unfreeze_backbone(self) -> None:
         self.backbone.unfreeze_backbone()
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+    def _build_time_aware_queries(
+        self,
+        *,
+        batch_size: int,
+        fps: float,
+        future_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if future_frames != self.num_waypoints:
+            raise ValueError(
+                "IDM future frame count must match configured waypoint count, "
+                f"got {future_frames} vs {self.num_waypoints}"
+            )
+
+        base_queries = self.waypoint_queries.expand(batch_size, -1, -1)
+        time_embedding = _build_sinusoidal_time_embedding(
+            num_steps=future_frames,
+            fps=fps,
+            dim=base_queries.shape[-1],
+            device=device,
+            dtype=dtype,
+        )
+        return base_queries + self.query_time_proj(time_embedding).unsqueeze(0)
+
+    def forward(self, clip: torch.Tensor, meta: Optional[IDMClipMeta] = None) -> torch.Tensor:
         tokens = self.backbone(clip)
         tokens = self.temporal_encoder(tokens)
 
-        queries = self.waypoint_queries.expand(tokens.shape[0], -1, -1)
+        future_frames = self.num_waypoints if meta is None else meta.future_frames
+        fps = 2.0 if meta is None else meta.fps
+        queries = self._build_time_aware_queries(
+            batch_size=tokens.shape[0],
+            fps=fps,
+            future_frames=future_frames,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
         decoded, _ = self.attn_head(queries, tokens, tokens, need_weights=False)
         decoded = self.head_norm(decoded)
         return self.head_mlp(decoded)
