@@ -483,7 +483,7 @@ def main() -> None:
         drop_last=False,
     )
 
-    model = build_drivelaw_idm_for_drivelaw(
+    model = build_resim_idm_for_drivelaw(
         num_waypoints=args.num_waypoints,
         xvo_root=args.xvo_root,
         flownet_root=args.flownet_root,
