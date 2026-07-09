@@ -15,6 +15,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset
 from yaml import safe_load
 
@@ -60,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default="", help="Checkpoint path or `auto`.")
     parser.add_argument("--keep-last", type=int, default=3, help="Keep only the latest N epoch checkpoints.")
     parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs.")
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=str,
+        default="",
+        help="Directory for TensorBoard event files. Defaults to <output-dir>/tensorboard.",
+    )
     parser.add_argument("--freeze-backbone", action="store_true", default=True)
     parser.add_argument("--unfreeze-backbone", dest="freeze_backbone", action="store_false")
     parser.add_argument("--xvo-root", type=str, default=None)
@@ -271,6 +278,12 @@ def optimizer_param_groups(model: nn.Module) -> List[Dict[str, object]]:
 def save_metrics_jsonl(path: Path, metrics: Dict[str, float]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
+
+
+def build_tensorboard_writer(output_dir: Path, tensorboard_dir_arg: str, resume_global_step: int) -> SummaryWriter:
+    tensorboard_dir = Path(tensorboard_dir_arg) if tensorboard_dir_arg else (output_dir / "tensorboard")
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(tensorboard_dir), purge_step=resume_global_step)
 
 
 def list_epoch_checkpoints(checkpoint_dir: Path) -> List[Path]:
@@ -504,117 +517,134 @@ def main() -> None:
             device=device,
         )
 
+    writer = build_tensorboard_writer(output_dir, args.tensorboard_dir, global_step)
+
     fps = 1.0 / float(args.interval_length)
     autocast_device = device.type if device.type in {"cuda", "cpu"} else "cuda"
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        model.train()
-        running = {
-            "loss": 0.0,
-            "ade": 0.0,
-            "fde": 0.0,
-            "yaw_mean": 0.0,
-            "yaw_final": 0.0,
-            "step_alignment_acc": 0.0,
-        }
-        seen_samples = 0
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            model.train()
+            running = {
+                "loss": 0.0,
+                "ade": 0.0,
+                "fde": 0.0,
+                "yaw_mean": 0.0,
+                "yaw_final": 0.0,
+                "step_alignment_acc": 0.0,
+            }
+            seen_samples = 0
 
-        for batch_index, batch in enumerate(train_loader, start=1):
-            batch = move_batch_to_device(batch, device)
-            future_video = batch["future_video"]
-            gt_waypoints = batch["trajectory"]
-            meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
+            for batch_index, batch in enumerate(train_loader, start=1):
+                batch = move_batch_to_device(batch, device)
+                future_video = batch["future_video"]
+                gt_waypoints = batch["trajectory"]
+                meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=autocast_device, enabled=(args.amp and device.type == "cuda")):
-                pred_waypoints = model(future_video, meta=meta)
-                metrics = compute_idm_supervised_metrics(
-                    pred_waypoints,
-                    gt_waypoints,
-                    lambda_pos=args.lambda_pos,
-                    lambda_yaw=args.lambda_yaw,
-                )
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type=autocast_device, enabled=(args.amp and device.type == "cuda")):
+                    pred_waypoints = model(future_video, meta=meta)
+                    metrics = compute_idm_supervised_metrics(
+                        pred_waypoints,
+                        gt_waypoints,
+                        lambda_pos=args.lambda_pos,
+                        lambda_yaw=args.lambda_yaw,
+                    )
 
-            scaler.scale(metrics["loss"]).backward()
-            scaler.unscale_(optimizer)
-            if args.grad_clip_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.scale(metrics["loss"]).backward()
+                scaler.unscale_(optimizer)
+                if args.grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
 
-            batch_size = future_video.shape[0]
-            seen_samples += batch_size
-            global_step += 1
-            for key in running:
-                running[key] += float(metrics[key].detach().cpu()) * batch_size
+                batch_size = future_video.shape[0]
+                seen_samples += batch_size
+                global_step += 1
+                for key in running:
+                    running[key] += float(metrics[key].detach().cpu()) * batch_size
 
-            if batch_index % args.log_every == 0:
-                logger.info(
-                    "Epoch %d Step %d | loss=%.4f ade=%.4f fde=%.4f yaw=%.4f align=%.4f",
-                    epoch,
-                    global_step,
-                    running["loss"] / seen_samples,
-                    running["ade"] / seen_samples,
-                    running["fde"] / seen_samples,
-                    running["yaw_mean"] / seen_samples,
-                    running["step_alignment_acc"] / seen_samples,
-                )
+                writer.add_scalar("lr/step", optimizer.param_groups[0]["lr"], global_step)
+                for key, value in metrics.items():
+                    writer.add_scalar(f"train_step/{key}", float(value.detach().cpu()), global_step)
 
-        scheduler.step()
-        train_metrics = {f"train/{key}": value / seen_samples for key, value in running.items()}
-        val_metrics = evaluate(
-            model=model,
-            dataloader=val_loader,
-            device=device,
-            fps=fps,
-            lambda_pos=args.lambda_pos,
-            lambda_yaw=args.lambda_yaw,
-            amp_enabled=(args.amp and device.type == "cuda"),
-        )
-        val_metrics = {f"val/{key}": value for key, value in val_metrics.items()}
+                if batch_index % args.log_every == 0:
+                    logger.info(
+                        "Epoch %d Step %d | loss=%.4f ade=%.4f fde=%.4f yaw=%.4f align=%.4f",
+                        epoch,
+                        global_step,
+                        running["loss"] / seen_samples,
+                        running["ade"] / seen_samples,
+                        running["fde"] / seen_samples,
+                        running["yaw_mean"] / seen_samples,
+                        running["step_alignment_acc"] / seen_samples,
+                    )
 
-        current_val_loss = val_metrics["val/loss"]
-        is_best = current_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = current_val_loss
-
-        epoch_summary = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "lr": optimizer.param_groups[0]["lr"],
-            "best_val_loss": best_val_loss,
-        }
-        epoch_summary.update(train_metrics)
-        epoch_summary.update(val_metrics)
-        save_metrics_jsonl(metrics_path, epoch_summary)
-
-        logger.info(
-            "Epoch %d done | train_loss=%.4f val_loss=%.4f val_ADE=%.4f val_FDE=%.4f val_align=%.4f",
-            epoch,
-            train_metrics["train/loss"],
-            val_metrics["val/loss"],
-            val_metrics["val/ade"],
-            val_metrics["val/fde"],
-            val_metrics["val/step_alignment_acc"],
-        )
-
-        if epoch % args.save_every == 0:
-            ckpt_path = save_checkpoint(
-                checkpoint_dir=checkpoint_dir,
-                epoch=epoch,
-                global_step=global_step,
+            scheduler.step()
+            train_metrics = {f"train/{key}": value / seen_samples for key, value in running.items()}
+            val_metrics = evaluate(
                 model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                best_val_loss=best_val_loss,
-                args=args,
-                is_best=is_best,
-                keep_last=args.keep_last,
+                dataloader=val_loader,
+                device=device,
+                fps=fps,
+                lambda_pos=args.lambda_pos,
+                lambda_yaw=args.lambda_yaw,
+                amp_enabled=(args.amp and device.type == "cuda"),
             )
-            logger.info("Saved checkpoint: %s", ckpt_path)
+            val_metrics = {f"val/{key}": value for key, value in val_metrics.items()}
 
-    logger.info("Finished IDM stage-1 training. Best val loss: %.6f", best_val_loss)
+            current_val_loss = val_metrics["val/loss"]
+            is_best = current_val_loss < best_val_loss
+            if is_best:
+                best_val_loss = current_val_loss
+
+            epoch_summary = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "lr": optimizer.param_groups[0]["lr"],
+                "best_val_loss": best_val_loss,
+            }
+            epoch_summary.update(train_metrics)
+            epoch_summary.update(val_metrics)
+            save_metrics_jsonl(metrics_path, epoch_summary)
+
+            writer.add_scalar("lr/epoch", optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar("best/val_loss", best_val_loss, epoch)
+            for key, value in train_metrics.items():
+                writer.add_scalar(key, value, epoch)
+            for key, value in val_metrics.items():
+                writer.add_scalar(key, value, epoch)
+            writer.flush()
+
+            logger.info(
+                "Epoch %d done | train_loss=%.4f val_loss=%.4f val_ADE=%.4f val_FDE=%.4f val_align=%.4f",
+                epoch,
+                train_metrics["train/loss"],
+                val_metrics["val/loss"],
+                val_metrics["val/ade"],
+                val_metrics["val/fde"],
+                val_metrics["val/step_alignment_acc"],
+            )
+
+            if epoch % args.save_every == 0:
+                ckpt_path = save_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    epoch=epoch,
+                    global_step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    best_val_loss=best_val_loss,
+                    args=args,
+                    is_best=is_best,
+                    keep_last=args.keep_last,
+                )
+                logger.info("Saved checkpoint: %s", ckpt_path)
+
+        logger.info("Finished IDM stage-1 training. Best val loss: %.6f", best_val_loss)
+    finally:
+        writer.close()
 
 
 if __name__ == "__main__":

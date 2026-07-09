@@ -109,7 +109,7 @@ def _build_sinusoidal_time_embedding(
     if dim <= 0:
         raise ValueError(f"dim must be positive, got {dim}")
 
-    times = torch.arange(1, num_steps + 1, device=device, dtype=torch.float32) / float(fps)
+    times = torch.arange(1, num_steps + 1, device=device, dtype=torch.float32) / float(fps) # [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
     half_dim = dim // 2
     if half_dim == 0:
         return times.unsqueeze(-1).to(dtype=dtype)
