@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import gzip
 import json
 import logging
+import os
 from pathlib import Path
 import pickle
 import random
@@ -13,10 +15,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, Dataset
 from yaml import safe_load
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -45,11 +50,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional YAML file containing `train_logs` and `val_logs` lists.",
     )
     parser.add_argument("--output-dir", type=str, required=True, help="Directory for logs and checkpoints.")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU process.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers per GPU process.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--image-height", type=int, default=768)
     parser.add_argument("--image-width", type=int, default=1344)
@@ -79,16 +84,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging(output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_path = output_dir / "train.log"
+def setup_logging(output_dir: Path, rank: int) -> None:
+    """Write the persistent log only from rank zero to avoid concurrent file writes."""
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if rank == 0:
+        handlers.append(logging.FileHandler(output_dir / "train.log", encoding="utf-8"))
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_path, encoding="utf-8"),
-        ],
+        format=f"%(asctime)s - %(levelname)s - rank{rank} - %(name)s - %(message)s",
+        handlers=handlers,
     )
 
 
@@ -98,6 +105,68 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def initialize_distributed(args: argparse.Namespace) -> Tuple[bool, int, int, int, torch.device]:
+    """Initialize torchrun/DDP state and return (enabled, rank, world_size, local_rank, device)."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed:
+        if args.device == "cpu" or not torch.cuda.is_available():
+            backend = "gloo"
+            device = torch.device("cpu")
+        else:
+            backend = "nccl"
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        dist.init_process_group(backend=backend, init_method="env://")
+    else:
+        device = torch.device(args.device)
+
+    return distributed, rank, world_size, local_rank, device
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def distributed_barrier(distributed: bool) -> None:
+    if distributed:
+        dist.barrier()
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    """Use the unified AMP API when available, with a PyTorch 2.0 fallback."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device.type, enabled=enabled)
+    if device.type == "cuda":
+        return torch.cuda.amp.autocast(enabled=enabled)
+    return nullcontext()
+
+
+def build_grad_scaler(enabled: bool):
+    """PyTorch 2.0 exposes GradScaler under torch.cuda.amp instead of torch.amp."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Partitions validation samples without padding or duplication across ranks."""
+
+    def __init__(self, dataset: Dataset, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self) -> Iterable[int]:
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        return (len(self.dataset) - self.rank + self.world_size - 1) // self.world_size
 
 
 def load_log_split(split_yaml: Optional[str]) -> Tuple[Optional[List[str]], Optional[List[str]]]:
@@ -332,7 +401,8 @@ def save_checkpoint(
         "epoch": epoch,
         "global_step": global_step,
         "best_val_loss": best_val_loss,
-        "model_state_dict": model.state_dict(),
+        # Save the underlying module so single-GPU and DDP checkpoints share one format.
+        "model_state_dict": unwrap_model(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
         "scaler_state_dict": None if scaler is None else scaler.state_dict(),
@@ -348,6 +418,21 @@ def save_checkpoint(
     return ckpt_path
 
 
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def load_model_state_dict(model: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load both current checkpoints and older checkpoints saved from a DDP wrapper."""
+    target = unwrap_model(model)
+    if any(key.startswith("module.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("module."): value
+            for key, value in state_dict.items()
+        }
+    target.load_state_dict(state_dict)
+
+
 def load_checkpoint(
     *,
     checkpoint_path: Path,
@@ -358,7 +443,7 @@ def load_checkpoint(
     device: torch.device,
 ) -> Tuple[int, int, float]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_model_state_dict(model, checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler_state = checkpoint.get("scheduler_state_dict")
     if scheduler is not None and scheduler_state is not None:
@@ -383,6 +468,24 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor | List[str]], device: tor
     return out
 
 
+def reduce_metric_sums(
+    metric_sums: Dict[str, float],
+    total_samples: int,
+    *,
+    device: torch.device,
+    distributed: bool,
+) -> Tuple[Dict[str, float], int]:
+    """Sum weighted metrics across DDP ranks before converting them to means."""
+    if not distributed:
+        return metric_sums, total_samples
+
+    keys = list(metric_sums)
+    values = [metric_sums[key] for key in keys] + [float(total_samples)]
+    reduced = torch.tensor(values, device=device, dtype=torch.float64)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    return ({key: float(reduced[index].item()) for index, key in enumerate(keys)}, int(reduced[-1].item()))
+
+
 def evaluate(
     *,
     model: nn.Module,
@@ -392,6 +495,7 @@ def evaluate(
     lambda_pos: float,
     lambda_yaw: float,
     amp_enabled: bool,
+    distributed: bool,
 ) -> Dict[str, float]:
     model.eval()
     metric_sums = {
@@ -404,7 +508,6 @@ def evaluate(
     }
     total_samples = 0
 
-    autocast_device = device.type if device.type in {"cuda", "cpu"} else "cuda"
     with torch.inference_mode():
         for batch in dataloader:
             batch = move_batch_to_device(batch, device)
@@ -412,7 +515,7 @@ def evaluate(
             gt_waypoints = batch["trajectory"]
             meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
 
-            with torch.amp.autocast(device_type=autocast_device, enabled=amp_enabled):
+            with autocast_context(device, amp_enabled):
                 pred_waypoints = model(future_video, meta=meta)
                 metrics = compute_idm_supervised_metrics(
                     pred_waypoints,
@@ -426,6 +529,12 @@ def evaluate(
             for key in metric_sums:
                 metric_sums[key] += float(metrics[key].detach().cpu()) * batch_size
 
+    metric_sums, total_samples = reduce_metric_sums(
+        metric_sums,
+        total_samples,
+        device=device,
+        distributed=distributed,
+    )
     if total_samples == 0:
         raise RuntimeError("Validation dataloader is empty.")
 
@@ -434,97 +543,137 @@ def evaluate(
 
 def main() -> None:
     args = parse_args()
+    distributed, rank, world_size, local_rank, device = initialize_distributed(args)
     output_dir = Path(args.output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     metrics_path = output_dir / "metrics.jsonl"
-
-    setup_logging(output_dir)
-    set_seed(args.seed)
-
-    device = torch.device(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    train_logs, val_logs = load_log_split(args.split_yaml)
-
-    logger.info("Building IDM stage-1 datasets from cache: %s", args.cache_path)
-    train_dataset = IDMStage1CacheDataset(
-        args.cache_path,
-        log_names=train_logs,
-        image_height=args.image_height,
-        image_width=args.image_width,
-        expected_steps=args.num_waypoints,
-    )
-    val_dataset = IDMStage1CacheDataset(
-        args.cache_path,
-        log_names=val_logs,
-        image_height=args.image_height,
-        image_width=args.image_width,
-        expected_steps=args.num_waypoints,
-    )
-    logger.info("Train samples: %d | Val samples: %d", len(train_dataset), len(val_dataset))
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=idm_stage1_collate,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=idm_stage1_collate,
-        drop_last=False,
-    )
-
-    model = build_resim_idm_for_drivelaw(
-        num_waypoints=args.num_waypoints,
-        xvo_root=args.xvo_root,
-        flownet_root=args.flownet_root,
-        xvo_checkpoint_path=args.xvo_checkpoint_path,
-        freeze_backbone=args.freeze_backbone,
-    ).to(device)
-    if args.freeze_backbone:
-        logger.info("Stage-1 training freezes the XVO backbone.")
-    else:
-        logger.info("Stage-1 training will update the XVO backbone.")
-
-    optimizer = torch.optim.AdamW(
-        optimizer_param_groups(model),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device.type == "cuda"))
-
-    start_epoch = 1
-    global_step = 0
-    best_val_loss = float("inf")
-    resume_ckpt = resolve_resume_checkpoint(checkpoint_dir, args.resume)
-    if resume_ckpt is not None:
-        start_epoch, global_step, best_val_loss = load_checkpoint(
-            checkpoint_path=resume_ckpt,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            device=device,
-        )
-
-    writer = build_tensorboard_writer(output_dir, args.tensorboard_dir, global_step)
-
-    fps = 1.0 / float(args.interval_length)
-    autocast_device = device.type if device.type in {"cuda", "cpu"} else "cuda"
+    writer: Optional[SummaryWriter] = None
 
     try:
+        if is_main_process(rank):
+            output_dir.mkdir(parents=True, exist_ok=True)
+        distributed_barrier(distributed)
+        setup_logging(output_dir, rank)
+        set_seed(args.seed + rank)
+
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        if is_main_process(rank):
+            logger.info(
+                "DDP enabled=%s | world_size=%d | per_gpu_batch_size=%d | global_batch_size=%d | device=%s",
+                distributed,
+                world_size,
+                args.batch_size,
+                args.batch_size * world_size,
+                device,
+            )
+
+        train_logs, val_logs = load_log_split(args.split_yaml)
+        if is_main_process(rank):
+            logger.info("Building IDM stage-1 datasets from cache: %s", args.cache_path)
+        train_dataset = IDMStage1CacheDataset(
+            args.cache_path,
+            log_names=train_logs,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            expected_steps=args.num_waypoints,
+        )
+        val_dataset = IDMStage1CacheDataset(
+            args.cache_path,
+            log_names=val_logs,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            expected_steps=args.num_waypoints,
+        )
+        if is_main_process(rank):
+            logger.info("Train samples: %d | Val samples: %d", len(train_dataset), len(val_dataset))
+
+        train_sampler: Optional[DistributedSampler] = None
+        val_sampler: Optional[Sampler[int]] = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=args.seed,
+                drop_last=False,
+            )
+            val_sampler = DistributedEvalSampler(val_dataset, rank=rank, world_size=world_size)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=idm_stage1_collate,
+            drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            collate_fn=idm_stage1_collate,
+            drop_last=False,
+        )
+
+        model = build_resim_idm_for_drivelaw(
+            num_waypoints=args.num_waypoints,
+            xvo_root=args.xvo_root,
+            flownet_root=args.flownet_root,
+            xvo_checkpoint_path=args.xvo_checkpoint_path,
+            freeze_backbone=args.freeze_backbone,
+        ).to(device)
+        if args.freeze_backbone:
+            if is_main_process(rank):
+                logger.info("Stage-1 training freezes the XVO backbone.")
+        elif is_main_process(rank):
+            logger.info("Stage-1 training will update the XVO backbone.")
+
+        if distributed:
+            ddp_kwargs: Dict[str, object] = {"broadcast_buffers": False}
+            if device.type == "cuda":
+                ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+            model = DistributedDataParallel(model, **ddp_kwargs)
+
+        optimizer = torch.optim.AdamW(
+            optimizer_param_groups(model),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+        scaler = build_grad_scaler(enabled=(args.amp and device.type == "cuda"))
+
+        start_epoch = 1
+        global_step = 0
+        best_val_loss = float("inf")
+        resume_ckpt = resolve_resume_checkpoint(checkpoint_dir, args.resume)
+        if resume_ckpt is not None:
+            start_epoch, global_step, best_val_loss = load_checkpoint(
+                checkpoint_path=resume_ckpt,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                device=device,
+            )
+        distributed_barrier(distributed)
+
+        if is_main_process(rank):
+            writer = build_tensorboard_writer(output_dir, args.tensorboard_dir, global_step)
+
+        fps = 1.0 / float(args.interval_length)
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             running = {
                 "loss": 0.0,
                 "ade": 0.0,
@@ -542,7 +691,7 @@ def main() -> None:
                 meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
 
                 optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast(device_type=autocast_device, enabled=(args.amp and device.type == "cuda")):
+                with autocast_context(device, enabled=(args.amp and device.type == "cuda")):
                     pred_waypoints = model(future_video, meta=meta)
                     metrics = compute_idm_supervised_metrics(
                         pred_waypoints,
@@ -564,11 +713,12 @@ def main() -> None:
                 for key in running:
                     running[key] += float(metrics[key].detach().cpu()) * batch_size
 
-                writer.add_scalar("lr/step", optimizer.param_groups[0]["lr"], global_step)
-                for key, value in metrics.items():
-                    writer.add_scalar(f"train_step/{key}", float(value.detach().cpu()), global_step)
+                if writer is not None:
+                    writer.add_scalar("lr/step", optimizer.param_groups[0]["lr"], global_step)
+                    for key, value in metrics.items():
+                        writer.add_scalar(f"train_step/{key}", float(value.detach().cpu()), global_step)
 
-                if batch_index % args.log_every == 0:
+                if is_main_process(rank) and batch_index % args.log_every == 0:
                     logger.info(
                         "Epoch %d Step %d | loss=%.4f ade=%.4f fde=%.4f yaw=%.4f align=%.4f",
                         epoch,
@@ -581,6 +731,14 @@ def main() -> None:
                     )
 
             scheduler.step()
+            running, seen_samples = reduce_metric_sums(
+                running,
+                seen_samples,
+                device=device,
+                distributed=distributed,
+            )
+            if seen_samples == 0:
+                raise RuntimeError("Training dataloader is empty.")
             train_metrics = {f"train/{key}": value / seen_samples for key, value in running.items()}
             val_metrics = evaluate(
                 model=model,
@@ -590,6 +748,7 @@ def main() -> None:
                 lambda_pos=args.lambda_pos,
                 lambda_yaw=args.lambda_yaw,
                 amp_enabled=(args.amp and device.type == "cuda"),
+                distributed=distributed,
             )
             val_metrics = {f"val/{key}": value for key, value in val_metrics.items()}
 
@@ -606,45 +765,54 @@ def main() -> None:
             }
             epoch_summary.update(train_metrics)
             epoch_summary.update(val_metrics)
-            save_metrics_jsonl(metrics_path, epoch_summary)
+            if is_main_process(rank):
+                save_metrics_jsonl(metrics_path, epoch_summary)
 
-            writer.add_scalar("lr/epoch", optimizer.param_groups[0]["lr"], epoch)
-            writer.add_scalar("best/val_loss", best_val_loss, epoch)
-            for key, value in train_metrics.items():
-                writer.add_scalar(key, value, epoch)
-            for key, value in val_metrics.items():
-                writer.add_scalar(key, value, epoch)
-            writer.flush()
+                if writer is not None:
+                    writer.add_scalar("lr/epoch", optimizer.param_groups[0]["lr"], epoch)
+                    writer.add_scalar("best/val_loss", best_val_loss, epoch)
+                    for key, value in train_metrics.items():
+                        writer.add_scalar(key, value, epoch)
+                    for key, value in val_metrics.items():
+                        writer.add_scalar(key, value, epoch)
+                    writer.flush()
 
-            logger.info(
-                "Epoch %d done | train_loss=%.4f val_loss=%.4f val_ADE=%.4f val_FDE=%.4f val_align=%.4f",
-                epoch,
-                train_metrics["train/loss"],
-                val_metrics["val/loss"],
-                val_metrics["val/ade"],
-                val_metrics["val/fde"],
-                val_metrics["val/step_alignment_acc"],
-            )
-
-            if epoch % args.save_every == 0:
-                ckpt_path = save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    epoch=epoch,
-                    global_step=global_step,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    best_val_loss=best_val_loss,
-                    args=args,
-                    is_best=is_best,
-                    keep_last=args.keep_last,
+                logger.info(
+                    "Epoch %d done | train_loss=%.4f val_loss=%.4f val_ADE=%.4f val_FDE=%.4f val_align=%.4f",
+                    epoch,
+                    train_metrics["train/loss"],
+                    val_metrics["val/loss"],
+                    val_metrics["val/ade"],
+                    val_metrics["val/fde"],
+                    val_metrics["val/step_alignment_acc"],
                 )
-                logger.info("Saved checkpoint: %s", ckpt_path)
 
-        logger.info("Finished IDM stage-1 training. Best val loss: %.6f", best_val_loss)
+                if epoch % args.save_every == 0:
+                    ckpt_path = save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        epoch=epoch,
+                        global_step=global_step,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        best_val_loss=best_val_loss,
+                        args=args,
+                        is_best=is_best,
+                        keep_last=args.keep_last,
+                    )
+                    logger.info("Saved checkpoint: %s", ckpt_path)
+
+            # Do not let a rank begin the next all-reduce before rank zero finishes checkpoint I/O.
+            distributed_barrier(distributed)
+
+        if is_main_process(rank):
+            logger.info("Finished IDM stage-1 training. Best val loss: %.6f", best_val_loss)
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
