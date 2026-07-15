@@ -26,6 +26,10 @@ if not hasattr(torch, "xpu"):
         def empty_cache() -> None:
             return None
 
+        @staticmethod
+        def device_count() -> int:
+            return 0
+
     torch.xpu = _TorchXPUCompat()
 
 if not hasattr(torch, "mps"):
@@ -37,6 +41,10 @@ if not hasattr(torch, "mps"):
         @staticmethod
         def empty_cache() -> None:
             return None
+
+        @staticmethod
+        def device_count() -> int:
+            return 0
 
     torch.mps = _TorchMPSCompat()
 
