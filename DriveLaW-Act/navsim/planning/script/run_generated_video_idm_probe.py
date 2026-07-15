@@ -52,6 +52,13 @@ if not hasattr(torch, "xpu"):
 if not hasattr(torch, "mps"):
     torch.mps = _UnavailableTorchBackend()
 
+# TorchAO is not used by this probe, but recent diffusers imports its
+# quantizer registry eagerly. PyTorch 2.0 has no float8 dtype symbols.
+if not hasattr(torch, "float8_e4m3fn"):
+    torch.float8_e4m3fn = torch.float16
+if not hasattr(torch, "float8_e5m2"):
+    torch.float8_e5m2 = torch.float16
+
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
