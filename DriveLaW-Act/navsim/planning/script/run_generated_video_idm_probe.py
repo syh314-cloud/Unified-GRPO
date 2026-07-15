@@ -14,39 +14,43 @@ from typing import Any, Dict
 import hydra
 import torch
 
-# Recent diffusers releases probe torch.xpu at import time, while the XVO
-# environment uses a CUDA-only PyTorch build without the optional XPU API.
+# Recent diffusers releases probe optional backends at import time, while the
+# XVO environment uses a CUDA-only PyTorch build. Provide the complete small
+# API surface diffusers expects for unavailable XPU/MPS backends.
+class _UnavailableTorchBackend:
+    @staticmethod
+    def is_available() -> bool:
+        return False
+
+    @staticmethod
+    def empty_cache() -> None:
+        return None
+
+    @staticmethod
+    def device_count() -> int:
+        return 0
+
+    @staticmethod
+    def manual_seed(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    @staticmethod
+    def manual_seed_all(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    @staticmethod
+    def current_device() -> int:
+        return 0
+
+    @staticmethod
+    def set_device(*args: Any, **kwargs: Any) -> None:
+        return None
+
+
 if not hasattr(torch, "xpu"):
-    class _TorchXPUCompat:
-        @staticmethod
-        def is_available() -> bool:
-            return False
-
-        @staticmethod
-        def empty_cache() -> None:
-            return None
-
-        @staticmethod
-        def device_count() -> int:
-            return 0
-
-    torch.xpu = _TorchXPUCompat()
-
+    torch.xpu = _UnavailableTorchBackend()
 if not hasattr(torch, "mps"):
-    class _TorchMPSCompat:
-        @staticmethod
-        def is_available() -> bool:
-            return False
-
-        @staticmethod
-        def empty_cache() -> None:
-            return None
-
-        @staticmethod
-        def device_count() -> int:
-            return 0
-
-    torch.mps = _TorchMPSCompat()
+    torch.mps = _UnavailableTorchBackend()
 
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
