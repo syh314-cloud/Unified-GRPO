@@ -59,6 +59,14 @@ if not hasattr(torch, "float8_e4m3fn"):
 if not hasattr(torch, "float8_e5m2"):
     torch.float8_e5m2 = torch.float16
 
+# Newer diffusers annotates optional parallelism classes with DeviceMesh.
+# This probe does not use that path, and PyTorch 2.0 does not expose it.
+if hasattr(torch, "distributed") and not hasattr(torch.distributed, "device_mesh"):
+    class _DeviceMeshCompat:
+        DeviceMesh = object
+
+    torch.distributed.device_mesh = _DeviceMeshCompat()
+
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
