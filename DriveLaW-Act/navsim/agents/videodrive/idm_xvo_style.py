@@ -104,8 +104,14 @@ def _build_sinusoidal_time_embedding(
     dim: int,
     device: torch.device,
     dtype: torch.dtype,
+    start_time_s: Optional[float] = None,
 ) -> torch.Tensor:
-    """Build fixed time embeddings for future queries q_k at k / fps seconds."""
+    """Build fixed sinusoidal embeddings on the physical time axis.
+
+    By default, the embedding times are the future waypoint times
+    ``1 / fps, ..., num_steps / fps``.  ``start_time_s`` is used for motion
+    tokens, whose timestamps are interval midpoints rather than interval ends.
+    """
     if num_steps <= 0:
         raise ValueError(f"num_steps must be positive, got {num_steps}")
     if fps <= 0.0:
@@ -113,7 +119,12 @@ def _build_sinusoidal_time_embedding(
     if dim <= 0:
         raise ValueError(f"dim must be positive, got {dim}")
 
-    times = torch.arange(1, num_steps + 1, device=device, dtype=torch.float32) / float(fps) # [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+    if start_time_s is None:
+        start_time_s = 1.0 / float(fps)
+    times = (
+        float(start_time_s)
+        + torch.arange(num_steps, device=device, dtype=torch.float32) / float(fps)
+    )
     half_dim = dim // 2
     if half_dim == 0:
         return times.unsqueeze(-1).to(dtype=dtype)
@@ -497,6 +508,14 @@ class ReSimStyleIDM(nn.Module):
             num_layers=num_temporal_layers,
         )
 
+        # Each XVO pair token represents one interval. Encoding its midpoint
+        # before temporal self-attention preserves the physical token order.
+        self.token_time_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
         self.waypoint_queries = nn.Parameter(torch.randn(1, num_waypoints, embed_dim) * 0.02)
         self.query_time_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
@@ -549,7 +568,6 @@ class ReSimStyleIDM(nn.Module):
 
     def forward(self, clip: torch.Tensor, meta: Optional[IDMClipMeta] = None) -> torch.Tensor:
         tokens = self.backbone(clip)
-        tokens = self.temporal_encoder(tokens)
 
         future_frames = self.num_waypoints if meta is None else meta.future_frames
         fps = 2.0 if meta is None else meta.fps
@@ -559,6 +577,18 @@ class ReSimStyleIDM(nn.Module):
                 f"tokens are 1:1 with waypoints; got {tokens.shape[1]} tokens for "
                 f"{future_frames} future frames."
             )
+
+        token_time_embedding = _build_sinusoidal_time_embedding(
+            num_steps=future_frames,
+            fps=fps,
+            dim=tokens.shape[-1],
+            device=tokens.device,
+            dtype=tokens.dtype,
+            start_time_s=0.5 / float(fps),
+        )
+        tokens = tokens + self.token_time_proj(token_time_embedding).unsqueeze(0)
+        tokens = self.temporal_encoder(tokens)
+
         queries = self._build_time_aware_queries(
             batch_size=tokens.shape[0],
             fps=fps,

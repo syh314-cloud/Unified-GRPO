@@ -61,6 +61,12 @@ if not hasattr(torch, "float8_e4m3fn"):
 if not hasattr(torch, "float8_e5m2"):
     torch.float8_e5m2 = torch.float16
 
+# PyTorch 2.0 also lacks TorchAO's uint1-uint7 dtype symbols. The probe does
+# not load quantized models, so uint8 placeholders are sufficient at import.
+for _name in ("uint1", "uint2", "uint3", "uint4", "uint5", "uint6", "uint7"):
+    if not hasattr(torch, _name):
+        setattr(torch, _name, torch.uint8)
+
 # Newer diffusers annotates optional parallelism classes with DeviceMesh.
 # This probe does not use that path, and PyTorch 2.0 does not expose it.
 if hasattr(torch, "distributed") and not hasattr(torch.distributed, "device_mesh"):
