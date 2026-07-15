@@ -13,6 +13,21 @@ from typing import Any, Dict
 
 import hydra
 import torch
+
+# Recent diffusers releases probe torch.xpu at import time, while the XVO
+# environment uses a CUDA-only PyTorch build without the optional XPU API.
+if not hasattr(torch, "xpu"):
+    class _TorchXPUCompat:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+        @staticmethod
+        def empty_cache() -> None:
+            return None
+
+    torch.xpu = _TorchXPUCompat()
+
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
