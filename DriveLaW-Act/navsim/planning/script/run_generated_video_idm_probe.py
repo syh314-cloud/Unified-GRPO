@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import types
 from pathlib import Path
 from typing import Any, Dict
 
@@ -66,6 +68,20 @@ if hasattr(torch, "distributed") and not hasattr(torch.distributed, "device_mesh
         DeviceMesh = object
 
     torch.distributed.device_mesh = _DeviceMeshCompat()
+
+# Diffusers imports context-parallel helpers eagerly. They are not used by
+# this single-GPU probe, and the module is absent from PyTorch 2.0.
+if hasattr(torch, "distributed") and "torch.distributed._functional_collectives" not in sys.modules:
+    _functional_collectives = types.ModuleType("torch.distributed._functional_collectives")
+    _functional_collectives.AsyncCollectiveTensor = object
+    for _name in (
+        "all_gather_tensor",
+        "all_reduce",
+        "reduce_scatter_tensor",
+        "wait_tensor",
+    ):
+        setattr(_functional_collectives, _name, lambda *args, **kwargs: None)
+    sys.modules["torch.distributed._functional_collectives"] = _functional_collectives
 
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
