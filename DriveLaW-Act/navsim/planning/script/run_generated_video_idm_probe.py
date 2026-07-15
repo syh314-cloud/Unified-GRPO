@@ -28,6 +28,18 @@ if not hasattr(torch, "xpu"):
 
     torch.xpu = _TorchXPUCompat()
 
+if not hasattr(torch, "mps"):
+    class _TorchMPSCompat:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+        @staticmethod
+        def empty_cache() -> None:
+            return None
+
+    torch.mps = _TorchMPSCompat()
+
 from diffusers.utils import export_to_video
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
