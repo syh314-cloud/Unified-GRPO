@@ -67,7 +67,7 @@ def build_drivelaw_idm_clip(
       - future_video : (B, C, 1, T_fut,  H, W) or squeezed variants
 
     Returns:
-      clip: (B, T_total, C, H, W) using only real frames
+      clip: (B, 1 + T_fut, C, H, W), ordered as [f0, f1, ..., f8]
       meta: semantic frame counts and effective fps
     """
     if history_video.ndim == 6:
@@ -79,9 +79,13 @@ def build_drivelaw_idm_clip(
     dt = float(future_interval_s)
     if dt <= 0.0:
         raise ValueError(f"future_interval_s must be positive, got {dt}")
-    clip = fut
+    hist = _to_bthwc_video(history_video)
+    if hist.shape[1] < 1:
+        raise ValueError("IDM requires one current frame f0 in history_video.")
+    current = hist[:, -1:]
+    clip = torch.cat([current, fut], dim=1)
     meta = IDMClipMeta(
-        history_frames=0,
+        history_frames=1,
         future_frames=fut.shape[1],
         fps=1.0 / dt,
     )
@@ -345,8 +349,29 @@ class ExternalXVOPairBackbone(nn.Module):
             params_mod.par.pretrained_flownet_path = str(self.flownet_root)
 
             vomodel_mod = importlib.import_module("model.vomodel")
-            VOModel = vomodel_mod.VOModel
-            model = VOModel()
+            # XVO's VOModel wraps this ViT with torchvision's FX feature extractor
+            # only to return the final norm tokens. Recent timm versions expose
+            # `is_causal`, which torchvision 0.15 traces as a Proxy and cannot pass
+            # to scaled_dot_product_attention. Build the two XVO components we use
+            # directly, so their checkpoint keys remain encoder.* / transformer.*.
+            model = nn.Module()
+            model.encoder = vomodel_mod.FlowNet()
+            transformer_params = dict(
+                img_size=(96, 160),
+                patch_size=(12, 16),
+                embed_dim=256,
+                depth=4,
+                num_heads=4,
+                num_classes=0,
+                in_chans=102,
+                class_token=False,
+                global_pool="",
+            )
+            model.transformer = vomodel_mod._create_vision_transformer(
+                "vit_base_patch16_224_in21k",
+                pretrained=False,
+                **transformer_params,
+            )
 
         self._load_pretrained_weights(model)
         return model.encoder, model.transformer, 256
@@ -411,7 +436,7 @@ class ExternalXVOPairBackbone(nn.Module):
         )
 
         pair_feats = self.encoder(pair_inputs)
-        pair_tokens = self.transformer(pair_feats)["feature"]
+        pair_tokens = self.transformer.forward_features(pair_feats)
         if pair_tokens.ndim == 3:
             pair_tokens = pair_tokens.mean(dim=1)
 
@@ -528,6 +553,12 @@ class ReSimStyleIDM(nn.Module):
 
         future_frames = self.num_waypoints if meta is None else meta.future_frames
         fps = 2.0 if meta is None else meta.fps
+        if tokens.shape[1] != future_frames:
+            raise ValueError(
+                "IDM requires one current frame plus all future frames so the XVO pair "
+                f"tokens are 1:1 with waypoints; got {tokens.shape[1]} tokens for "
+                f"{future_frames} future frames."
+            )
         queries = self._build_time_aware_queries(
             batch_size=tokens.shape[0],
             fps=fps,
@@ -535,7 +566,12 @@ class ReSimStyleIDM(nn.Module):
             device=tokens.device,
             dtype=tokens.dtype,
         )
-        decoded, _ = self.attn_head(queries, tokens, tokens, need_weights=False)
+        decoded, _ = self.attn_head(
+            queries,
+            tokens,
+            tokens,
+            need_weights=False,
+        )
         decoded = self.head_norm(decoded)
         return self.head_mlp(decoded)
 

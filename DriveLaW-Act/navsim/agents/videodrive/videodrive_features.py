@@ -258,11 +258,27 @@ class TrajectoryTargetBuilder(AbstractTargetBuilder):
         fut = scene.get_future_trajectory(num_trajectory_frames=self._trajectory_sampling.num_poses)
         traj = torch.tensor(fut.poses)
 
+        # Store the current front frame as f0 so the IDM can form the
+        # interval pairs (f0,f1), ..., (f7,f8) without a synthetic frame.
+        current_cams = scene.frames[scene.scene_metadata.num_history_frames - 1].cameras
+        current_mode, current_item = self._grab_cam(current_cams)
+        if current_mode == "path":
+            current_frame_path = current_item
+            current_frame = None
+        else:
+            current_frame_path = None
+            current_frame = self._to_chw_tensor(current_item)
+
         cams_seq: List[Any] = scene.get_future_frames(
             num_trajectory_frames=self._trajectory_sampling.num_poses
         )
         if len(cams_seq) == 0:
-            return {"trajectory": traj}
+            result = {"trajectory": traj}
+            if current_frame is not None:
+                result["current_frame"] = current_frame
+            else:
+                result["current_image_path"] = current_frame_path
+            return result
 
         got_path = False
         frames_tensor: List[torch.Tensor] = []
@@ -287,12 +303,21 @@ class TrajectoryTargetBuilder(AbstractTargetBuilder):
 
         if got_path:
             if self.view_mode == "front":
-                return {"trajectory": traj, "future_image_paths": fut_paths_front}
+                return {
+                    "trajectory": traj,
+                    "current_image_path": current_frame_path,
+                    "future_image_paths": fut_paths_front,
+                }
             else:
                 return {"trajectory": traj, "future_image_paths": fut_paths_surround}
         else:
             future_frames = torch.stack(frames_tensor, dim=0)
-            return {"trajectory": traj, "future_frames": future_frames}
+            result = {
+                "trajectory": traj,
+                "current_frame": current_frame,
+                "future_frames": future_frames,
+            }
+            return result
 
 
 def _resize_to_hw(img: torch.Tensor, height: int = 768, width: int = 1344) -> torch.Tensor:

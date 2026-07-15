@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-waypoints", type=int, default=8)
     parser.add_argument("--lambda-pos", type=float, default=1.0)
     parser.add_argument("--lambda-yaw", type=float, default=0.2)
+    parser.add_argument(
+        "--lambda-speed",
+        type=float,
+        default=0.1,
+        help="Weight for matching per-0.5s GT step distances; set 0 to disable.",
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--resume", type=str, default="", help="Checkpoint path or `auto`.")
     parser.add_argument("--keep-last", type=int, default=3, help="Keep only the latest N epoch checkpoints.")
@@ -78,6 +84,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flownet-root", type=str, default=None)
     parser.add_argument("--xvo-checkpoint-path", type=str, default=None)
     parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=0,
+        help="Maximum optimizer steps per epoch; 0 uses the full training loader.",
+    )
+    parser.add_argument(
+        "--max-val-steps",
+        type=int,
+        default=0,
+        help="Maximum validation batches per epoch; 0 uses the full validation loader.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
@@ -256,6 +274,27 @@ class IDMStage1CacheDataset(Dataset):
 
         raise KeyError("trajectory_target cache must contain `future_frames` or `future_image_paths`.")
 
+    def _load_current_frame(self, target_dict: Dict[str, object]) -> torch.Tensor:
+        if "current_frame" in target_dict and isinstance(target_dict["current_frame"], torch.Tensor):
+            frame = target_dict["current_frame"]
+            if frame.ndim != 3:
+                raise ValueError(f"Expected current_frame shaped (C,H,W), got {tuple(frame.shape)}")
+            return F.interpolate(
+                frame.unsqueeze(0),
+                size=(self.image_height, self.image_width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        current_path = target_dict.get("current_image_path")
+        if isinstance(current_path, (str, Path)):
+            return load_image_as_tensor(current_path, self.image_height, self.image_width)
+
+        raise KeyError(
+            "trajectory_target cache is missing `current_frame`/`current_image_path`; "
+            "regenerate the cache after enabling f0 storage."
+        )
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str]:
         target_path = self.samples[index]
         target_dict = load_pickle_gz(target_path)
@@ -265,6 +304,7 @@ class IDMStage1CacheDataset(Dataset):
             trajectory = torch.tensor(trajectory, dtype=torch.float32)
         trajectory = trajectory.float()
 
+        current_frame = self._load_current_frame(target_dict).float()
         future_video = self._load_future_frames(target_dict).float()
 
         if future_video.shape[0] != self.expected_steps:
@@ -281,6 +321,7 @@ class IDMStage1CacheDataset(Dataset):
             raise ValueError(f"Expected trajectory shape (T,3), got {tuple(trajectory.shape)} for sample {target_path}")
 
         return {
+            "current_frame": current_frame,
             "future_video": future_video,
             "trajectory": trajectory,
             "token": target_path.parent.name,
@@ -288,10 +329,12 @@ class IDMStage1CacheDataset(Dataset):
 
 
 def idm_stage1_collate(batch: Sequence[Dict[str, torch.Tensor | str]]) -> Dict[str, torch.Tensor | List[str]]:
+    current_frame = torch.stack([sample["current_frame"] for sample in batch], dim=0)
     future_video = torch.stack([sample["future_video"] for sample in batch], dim=0)
     trajectory = torch.stack([sample["trajectory"] for sample in batch], dim=0)
     tokens = [str(sample["token"]) for sample in batch]
     return {
+        "current_frame": current_frame,
         "future_video": future_video,
         "trajectory": trajectory,
         "tokens": tokens,
@@ -304,15 +347,23 @@ def compute_idm_supervised_metrics(
     *,
     lambda_pos: float,
     lambda_yaw: float,
+    lambda_speed: float,
 ) -> Dict[str, torch.Tensor]:
     pos_error_steps = torch.norm(pred_waypoints[..., :2] - gt_waypoints[..., :2], dim=-1)
     yaw_error_steps = angle_wrap(pred_waypoints[..., 2] - gt_waypoints[..., 2]).abs()
+
+    origin = torch.zeros_like(pred_waypoints[:, :1, :2])
+    pred_points = torch.cat([origin, pred_waypoints[..., :2]], dim=1)
+    gt_points = torch.cat([origin, gt_waypoints[..., :2]], dim=1)
+    pred_step_dist = torch.norm(pred_points[:, 1:] - pred_points[:, :-1], dim=-1)
+    gt_step_dist = torch.norm(gt_points[:, 1:] - gt_points[:, :-1], dim=-1)
+    speed_loss = (pred_step_dist - gt_step_dist).abs().mean()
 
     ade = pos_error_steps.mean()
     fde = pos_error_steps[:, -1].mean()
     yaw_mean = yaw_error_steps.mean()
     yaw_final = yaw_error_steps[:, -1].mean()
-    total_loss = lambda_pos * ade + lambda_yaw * yaw_mean
+    total_loss = lambda_pos * ade + lambda_yaw * yaw_mean + lambda_speed * speed_loss
 
     nearest_indices = torch.cdist(pred_waypoints[..., :2], gt_waypoints[..., :2]).argmin(dim=-1)
     diagonal = torch.arange(pred_waypoints.shape[1], device=pred_waypoints.device).unsqueeze(0)
@@ -324,6 +375,7 @@ def compute_idm_supervised_metrics(
         "fde": fde,
         "yaw_mean": yaw_mean,
         "yaw_final": yaw_final,
+        "speed_loss": speed_loss,
         "step_alignment_acc": step_alignment_acc,
     }
 
@@ -494,8 +546,10 @@ def evaluate(
     fps: float,
     lambda_pos: float,
     lambda_yaw: float,
+    lambda_speed: float,
     amp_enabled: bool,
     distributed: bool,
+    max_steps: int,
 ) -> Dict[str, float]:
     model.eval()
     metric_sums = {
@@ -504,30 +558,37 @@ def evaluate(
         "fde": 0.0,
         "yaw_mean": 0.0,
         "yaw_final": 0.0,
+        "speed_loss": 0.0,
         "step_alignment_acc": 0.0,
     }
     total_samples = 0
 
     with torch.inference_mode():
-        for batch in dataloader:
+        for batch_index, batch in enumerate(dataloader, start=1):
             batch = move_batch_to_device(batch, device)
+            current_frame = batch["current_frame"]
             future_video = batch["future_video"]
             gt_waypoints = batch["trajectory"]
-            meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
+            clip = torch.cat([current_frame.unsqueeze(1), future_video], dim=1)
+            meta = IDMClipMeta(history_frames=1, future_frames=future_video.shape[1], fps=fps)
 
             with autocast_context(device, amp_enabled):
-                pred_waypoints = model(future_video, meta=meta)
+                pred_waypoints = model(clip, meta=meta)
                 metrics = compute_idm_supervised_metrics(
                     pred_waypoints,
                     gt_waypoints,
                     lambda_pos=lambda_pos,
                     lambda_yaw=lambda_yaw,
+                    lambda_speed=lambda_speed,
                 )
 
             batch_size = future_video.shape[0]
             total_samples += batch_size
             for key in metric_sums:
                 metric_sums[key] += float(metrics[key].detach().cpu()) * batch_size
+
+            if max_steps > 0 and batch_index >= max_steps:
+                break
 
     metric_sums, total_samples = reduce_metric_sums(
         metric_sums,
@@ -680,24 +741,28 @@ def main() -> None:
                 "fde": 0.0,
                 "yaw_mean": 0.0,
                 "yaw_final": 0.0,
+                "speed_loss": 0.0,
                 "step_alignment_acc": 0.0,
             }
             seen_samples = 0
 
             for batch_index, batch in enumerate(train_loader, start=1):
                 batch = move_batch_to_device(batch, device)
+                current_frame = batch["current_frame"]
                 future_video = batch["future_video"]
                 gt_waypoints = batch["trajectory"]
-                meta = IDMClipMeta(history_frames=0, future_frames=future_video.shape[1], fps=fps)
+                clip = torch.cat([current_frame.unsqueeze(1), future_video], dim=1)
+                meta = IDMClipMeta(history_frames=1, future_frames=future_video.shape[1], fps=fps)
 
                 optimizer.zero_grad(set_to_none=True)
                 with autocast_context(device, enabled=(args.amp and device.type == "cuda")):
-                    pred_waypoints = model(future_video, meta=meta)
+                    pred_waypoints = model(clip, meta=meta)
                     metrics = compute_idm_supervised_metrics(
                         pred_waypoints,
                         gt_waypoints,
                         lambda_pos=args.lambda_pos,
                         lambda_yaw=args.lambda_yaw,
+                        lambda_speed=args.lambda_speed,
                     )
 
                 scaler.scale(metrics["loss"]).backward()
@@ -720,15 +785,21 @@ def main() -> None:
 
                 if is_main_process(rank) and batch_index % args.log_every == 0:
                     logger.info(
-                        "Epoch %d Step %d | loss=%.4f ade=%.4f fde=%.4f yaw=%.4f align=%.4f",
+                        "Epoch %d Step %d | loss=%.4f ade=%.4f fde=%.4f yaw=%.4f speed=%.4f align=%.4f",
                         epoch,
                         global_step,
                         running["loss"] / seen_samples,
                         running["ade"] / seen_samples,
                         running["fde"] / seen_samples,
                         running["yaw_mean"] / seen_samples,
+                        running["speed_loss"] / seen_samples,
                         running["step_alignment_acc"] / seen_samples,
                     )
+
+                if args.max_train_steps > 0 and batch_index >= args.max_train_steps:
+                    if is_main_process(rank):
+                        logger.info("Reached --max-train-steps=%d; ending epoch early.", args.max_train_steps)
+                    break
 
             scheduler.step()
             running, seen_samples = reduce_metric_sums(
@@ -747,8 +818,10 @@ def main() -> None:
                 fps=fps,
                 lambda_pos=args.lambda_pos,
                 lambda_yaw=args.lambda_yaw,
+                lambda_speed=args.lambda_speed,
                 amp_enabled=(args.amp and device.type == "cuda"),
                 distributed=distributed,
+                max_steps=args.max_val_steps,
             )
             val_metrics = {f"val/{key}": value for key, value in val_metrics.items()}
 
