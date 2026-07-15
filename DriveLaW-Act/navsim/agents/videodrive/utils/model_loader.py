@@ -42,41 +42,33 @@ class LtxvModelVersion(str, Enum):
     @property
     def hf_repo(self) -> str:
         """Get the HuggingFace repo for this version."""
-        match self:
-            case LtxvModelVersion.LTXV_2B_090:
-                return "Lightricks/LTX-Video"
-            case LtxvModelVersion.LTXV_2B_091:
-                return "Lightricks/LTX-Video-0.9.1"
-            case LtxvModelVersion.LTXV_2B_095:
-                return "Lightricks/LTX-Video-0.9.5"
-            case LtxvModelVersion.LTXV_2B_096_DEV:
-                raise ValueError("LTXV_2B_096_DEV does not have a HuggingFace repo")
-            case LtxvModelVersion.LTXV_2B_096_DISTILLED:
-                raise ValueError("LTXV_2B_096_DISTILLED does not have a HuggingFace repo")
-            case LtxvModelVersion.LTXV_13B_097_DEV:
-                return "Lightricks/LTX-Video-0.9.7-dev"
-            case LtxvModelVersion.LTXV_13B_097_DISTILLED:
-                return "Lightricks/LTX-Video-0.9.7-distilled"
+        repos = {
+            LtxvModelVersion.LTXV_2B_090: "Lightricks/LTX-Video",
+            LtxvModelVersion.LTXV_2B_091: "Lightricks/LTX-Video-0.9.1",
+            LtxvModelVersion.LTXV_2B_095: "Lightricks/LTX-Video-0.9.5",
+            LtxvModelVersion.LTXV_13B_097_DEV: "Lightricks/LTX-Video-0.9.7-dev",
+            LtxvModelVersion.LTXV_13B_097_DISTILLED: "Lightricks/LTX-Video-0.9.7-distilled",
+        }
+        if self in repos:
+            return repos[self]
+        if self in (LtxvModelVersion.LTXV_2B_096_DEV, LtxvModelVersion.LTXV_2B_096_DISTILLED):
+            raise ValueError(f"{self} does not have a HuggingFace repo")
         raise ValueError(f"Unknown version: {self}")
 
     @property
     def safetensors_url(self) -> str:  # noqa: PLR0911
         """Get the safetensors URL for this version."""
-        match self:
-            case LtxvModelVersion.LTXV_2B_090:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.safetensors"
-            case LtxvModelVersion.LTXV_2B_091:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.1.safetensors"
-            case LtxvModelVersion.LTXV_2B_095:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.5.safetensors"
-            case LtxvModelVersion.LTXV_2B_096_DEV:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-2b-0.9.6-dev-04-25.safetensors"
-            case LtxvModelVersion.LTXV_2B_096_DISTILLED:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-2b-0.9.6-distilled-04-25.safetensors"
-            case LtxvModelVersion.LTXV_13B_097_DEV:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-13b-0.9.7-dev.safetensors"
-            case LtxvModelVersion.LTXV_13B_097_DISTILLED:
-                return "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-13b-0.9.7-distilled.safetensors"
+        urls = {
+            LtxvModelVersion.LTXV_2B_090: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.safetensors",
+            LtxvModelVersion.LTXV_2B_091: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.1.safetensors",
+            LtxvModelVersion.LTXV_2B_095: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltx-video-2b-v0.9.5.safetensors",
+            LtxvModelVersion.LTXV_2B_096_DEV: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-2b-0.9.6-dev-04-25.safetensors",
+            LtxvModelVersion.LTXV_2B_096_DISTILLED: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-2b-0.9.6-distilled-04-25.safetensors",
+            LtxvModelVersion.LTXV_13B_097_DEV: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-13b-0.9.7-dev.safetensors",
+            LtxvModelVersion.LTXV_13B_097_DISTILLED: "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-13b-0.9.7-distilled.safetensors",
+        }
+        if self in urls:
+            return urls[self]
         raise ValueError(f"Unknown version: {self}")
 
 
