@@ -47,7 +47,7 @@ from .idm_xvo_style import (
 from torch.utils.tensorboard import SummaryWriter
 from .utils import init_logging, import_custom_class, save_video
 from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
-from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
+from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 
 import os

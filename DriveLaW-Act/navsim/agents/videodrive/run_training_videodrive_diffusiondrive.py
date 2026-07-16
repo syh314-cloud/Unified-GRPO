@@ -61,7 +61,7 @@ from utils.data_utils import (
 from utils.timestep_samplers import SAMPLERS
 
 from utils.extra_utils import act_metric
-from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
+from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
 
 # ---------------- NavSim deps ----------------
 from navsim.agents.abstract_agent import AbstractAgent
