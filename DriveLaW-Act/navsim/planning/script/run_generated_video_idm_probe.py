@@ -67,6 +67,18 @@ for _name in ("uint1", "uint2", "uint3", "uint4", "uint5", "uint6", "uint7"):
     if not hasattr(torch, _name):
         setattr(torch, _name, torch.uint8)
 
+# Diffusers decorates optional pipeline methods with torch.compiler.disable,
+# which is unavailable in PyTorch 2.0. Compilation is not used by this probe.
+if not hasattr(torch, "compiler"):
+    class _TorchCompilerCompat:
+        @staticmethod
+        def disable(function=None, *args: Any, **kwargs: Any):
+            if function is None:
+                return lambda wrapped: wrapped
+            return function
+
+    torch.compiler = _TorchCompilerCompat()
+
 # Newer diffusers annotates optional parallelism classes with DeviceMesh.
 # This probe does not use that path, and PyTorch 2.0 does not expose it.
 if hasattr(torch, "distributed") and not hasattr(torch.distributed, "device_mesh"):
