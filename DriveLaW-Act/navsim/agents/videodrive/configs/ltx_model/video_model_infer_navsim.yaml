@@ -132,6 +132,14 @@ use_color_jitter: true
 num_inference_step: 5
 noisy_video: true
 
+# Video/IDM temporal alignment. The model generates at 8 FPS; the IDM
+# receives samples at 0.5 s, so the agent temporally resamples the future
+# video instead of treating consecutive video frames as waypoints.
+frame_rate: 8
+condition_frames: 4
+num_waypoints: 8
+num_frames: 37
+
 # false for quick debug, for training set True
 load_weights: true
 

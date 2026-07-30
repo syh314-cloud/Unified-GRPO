@@ -323,7 +323,16 @@ class VideoDriveAgent(AbstractAgent):
         torch.cuda.synchronize()
         timing["image_preprocessing"] = time.perf_counter() - t0
 
-        num_frames = int(getattr(args, "num_frames", 9))
+        # Generate at the model's native temporal rate, then explicitly
+        # resample to the IDM waypoint timestamps below.
+        video_fps = int(getattr(args, "frame_rate", 8))
+        condition_frames = int(getattr(args, "condition_frames", t_cond))
+        num_waypoints = int(getattr(args, "num_waypoints", 8))
+        waypoint_interval_s = float(self._trajectory_sampling.interval_length)
+        required_future_frames = int(math.ceil(num_waypoints * waypoint_interval_s * video_fps))
+        num_frames = int(
+            getattr(args, "num_frames", condition_frames + required_future_frames + 1)
+        )
         num_steps = int(getattr(args, "num_inference_step", 20))
         seed = int(getattr(args, "seed", 42))
         negative_prompt = getattr(
@@ -353,6 +362,10 @@ class VideoDriveAgent(AbstractAgent):
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "num_frames": num_frames,
+            "video_fps": video_fps,
+            "condition_frames": condition_frames,
+            "num_waypoints": num_waypoints,
+            "waypoint_interval_s": waypoint_interval_s,
             "num_steps": num_steps,
             "seed": seed,
             "action_chunk": action_chunk,
@@ -367,6 +380,10 @@ class VideoDriveAgent(AbstractAgent):
         self,
         cond_tensor: torch.Tensor,
         preds: Dict[str, torch.Tensor],
+        video_fps: int,
+        condition_frames: int,
+        num_waypoints: int,
+        waypoint_interval_s: float,
     ) -> Dict[str, object]:
         actions = preds["actions"]
         generated_video = preds["videos"]
@@ -383,11 +400,29 @@ class VideoDriveAgent(AbstractAgent):
         if generated_video.ndim != 5:
             raise ValueError(f"Expected generated video shape (B,F,C,H,W), got {tuple(generated_video.shape)}")
 
-        future_frames_for_idm = min(8, generated_video.shape[1])
-        generated_future_video = generated_video[:, :future_frames_for_idm].contiguous()
-        if generated_future_video.shape[1] < 8:
-            pad = generated_future_video[:, -1:].repeat(1, 8 - generated_future_video.shape[1], 1, 1, 1)
-            generated_future_video = torch.cat([generated_future_video, pad], dim=1)
+        if video_fps <= 0:
+            raise ValueError(f"video_fps must be positive, got {video_fps}")
+        if condition_frames < 0 or condition_frames >= generated_video.shape[1]:
+            raise ValueError(
+                f"condition_frames={condition_frames} is invalid for generated video with "
+                f"{generated_video.shape[1]} frames"
+            )
+
+        # Remove the conditioning prefix. The remaining frames are ordered at
+        # video_fps, while IDM waypoints are ordered every waypoint_interval_s.
+        future_video = generated_video[:, condition_frames:].contiguous()
+        target_times = torch.arange(1, num_waypoints + 1, dtype=torch.float32) * waypoint_interval_s
+        # Frame 0 is the first future sample, so t seconds maps to ceil(t*fps)-1.
+        target_indices = torch.ceil(target_times * video_fps).long() - 1
+        max_index = int(target_indices.max().item())
+        if future_video.shape[1] <= max_index:
+            raise ValueError(
+                "Generated video is too short for IDM temporal alignment: "
+                f"need {max_index + 1} future frames at {video_fps} FPS for "
+                f"{num_waypoints} waypoints every {waypoint_interval_s:.3f}s, "
+                f"but got {future_video.shape[1]}. Increase num_frames."
+            )
+        generated_future_video = future_video[:, target_indices].contiguous()
 
         batch_size = generated_future_video.shape[0]
         history_video = cond_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1).detach().float().cpu()
@@ -440,6 +475,7 @@ class VideoDriveAgent(AbstractAgent):
             width=infer_inputs["width"],
             generator=generator,
             num_frames=infer_inputs["num_frames"],
+            frame_rate=infer_inputs["video_fps"],
             num_videos_per_prompt=sample_time,
             output_type="pt",
             return_action=True,
@@ -455,7 +491,14 @@ class VideoDriveAgent(AbstractAgent):
         timing["pipe_infer"] = time.perf_counter() - t1
 
         preds = out.frames if hasattr(out, "frames") else out
-        rollout = self._postprocess_joint_rollout_outputs(infer_inputs["cond_tensor"], preds)
+        rollout = self._postprocess_joint_rollout_outputs(
+            infer_inputs["cond_tensor"],
+            preds,
+            video_fps=infer_inputs["video_fps"],
+            condition_frames=infer_inputs["condition_frames"],
+            num_waypoints=infer_inputs["num_waypoints"],
+            waypoint_interval_s=infer_inputs["waypoint_interval_s"],
+        )
         rollout["timing"] = timing
         return rollout
 
