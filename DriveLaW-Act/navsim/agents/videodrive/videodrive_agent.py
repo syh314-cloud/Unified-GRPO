@@ -486,6 +486,9 @@ class VideoDriveAgent(AbstractAgent):
             noise_seed=generator_seed,
             pixel_wise_timestep=True,
             image_cond_noise_scale=0.0,
+            freeze_action_video_features=bool(
+                getattr(self.args, "freeze_action_video_features", True)
+            ),
         )
         torch.cuda.synchronize()
         timing["pipe_infer"] = time.perf_counter() - t1

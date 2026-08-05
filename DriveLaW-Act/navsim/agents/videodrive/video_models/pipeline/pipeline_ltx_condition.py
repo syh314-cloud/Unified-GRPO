@@ -913,6 +913,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         n_chunk: int = 1,
         context_dict: Optional[Dict[str, torch.Tensor]] = None,
         action_timestep: Optional[torch.LongTensor] = None,
+        freeze_action_video_features: bool = False,
         **kwargs,
     ):
         r"""
@@ -1247,7 +1248,8 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                 latent_model_input = latent_model_input.to(prompt_embeds.dtype)
 
                 compute_video = i == 0 or return_video
-                store_buffer = i == 0 and not return_video
+                store_buffer = i == 0 and (not return_video or freeze_action_video_features)
+                use_video_states_buffer_for_action = freeze_action_video_features and i > 0
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0], conditioning_mask_model_input.shape[1]).float()
                 if is_conditioning_image_or_video:
@@ -1299,6 +1301,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                         return_action=return_action,
                         video_states_buffer=video_states_buffer,
                         store_buffer=store_buffer,
+                        use_video_states_buffer_for_action=use_video_states_buffer_for_action,
                         context_dict=context_dict,
                     )[0]
                 if store_buffer:
