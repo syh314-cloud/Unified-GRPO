@@ -160,6 +160,12 @@ def _save_video(video: torch.Tensor, path: Path, fps: float) -> None:
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
+    if os.environ.get("ACTION_ONLY", "0") == "1":
+        from navsim.planning.script.run_action_only_probe import run_action_only_probe
+
+        run_action_only_probe(cfg)
+        return
+
     probe = cfg.probe
     output_dir = Path(str(probe.output_dir))
     video_dir = output_dir / "videos"

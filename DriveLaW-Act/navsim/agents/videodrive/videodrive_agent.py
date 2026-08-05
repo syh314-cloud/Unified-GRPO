@@ -385,14 +385,8 @@ class VideoDriveAgent(AbstractAgent):
         num_waypoints: int,
         waypoint_interval_s: float,
     ) -> Dict[str, object]:
-        actions = preds["actions"]
+        actions = self._postprocess_action_outputs(preds["actions"])
         generated_video = preds["videos"]
-
-        final_action_clip_value = 1.0
-        if final_action_clip_value is not None:
-            actions = actions.clone()
-            actions.clamp_(-final_action_clip_value, final_action_clip_value)
-        actions = denorm_odo(actions).detach().float().cpu()  # (G, action_chunk, action_dim)
 
         if not torch.is_tensor(generated_video):
             raise TypeError(f"Expected generated video to be a tensor, got {type(generated_video)}")
@@ -441,6 +435,61 @@ class VideoDriveAgent(AbstractAgent):
             "generated_future_video_bcthw": generated_future_video_bcthw,
             "idm_clip": idm_clip,
             "idm_meta": idm_meta,
+        }
+
+    @staticmethod
+    def _postprocess_action_outputs(actions: torch.Tensor) -> torch.Tensor:
+        actions = actions.clone()
+        actions.clamp_(-1.0, 1.0)
+        return denorm_odo(actions).detach().float().cpu()
+
+    @torch.inference_mode()
+    def sample_action_rollouts(
+        self,
+        features: Dict[str, torch.Tensor],
+        sample_time: int = 1,
+        seed: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Sample actions through the official cached-video-feature inference path."""
+        device = self.device
+        infer_inputs = self._prepare_joint_infer_inputs(features)
+        timing = infer_inputs["timing"]
+        generator_seed = infer_inputs["seed"] if seed is None else int(seed)
+        generator = torch.Generator(device=device).manual_seed(generator_seed)
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        out = self.pipe.infer(
+            conditions=[infer_inputs["condition"]],
+            prompt=infer_inputs["prompt"],
+            negative_prompt=infer_inputs["negative_prompt"],
+            num_inference_steps=infer_inputs["num_steps"],
+            guidance_scale=1.0,
+            height=infer_inputs["height"],
+            width=infer_inputs["width"],
+            generator=generator,
+            num_frames=infer_inputs["num_frames"],
+            frame_rate=infer_inputs["video_fps"],
+            num_videos_per_prompt=sample_time,
+            output_type="latent",
+            return_action=True,
+            return_video=False,
+            action_chunk=infer_inputs["action_chunk"],
+            action_dim=infer_inputs["action_dim"],
+            context_dict=infer_inputs["context_dict"],
+            noise_seed=generator_seed,
+            pixel_wise_timestep=True,
+            image_cond_noise_scale=0.0,
+        )
+        torch.cuda.synchronize()
+        timing["pipe_infer"] = time.perf_counter() - start
+
+        preds = out.frames if hasattr(out, "frames") else out
+        actions = self._postprocess_action_outputs(preds["actions"])
+        return {
+            "actions_tensor": actions,
+            "actions": actions.numpy(),
+            "timing": timing,
         }
 
     @torch.inference_mode()
