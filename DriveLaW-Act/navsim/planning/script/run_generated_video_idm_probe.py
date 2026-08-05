@@ -198,6 +198,7 @@ def main(cfg: DictConfig) -> None:
         "idm_checkpoint": str(probe.idm_checkpoint),
         "world_model_config": str(cfg.agent.config_file),
         "tokens": [],
+        "idm_inference_seconds": [],
     }
 
     with torch.inference_mode():
@@ -212,7 +213,16 @@ def main(cfg: DictConfig) -> None:
             generated_video = predictions["generated_future_video"].detach().float().cpu()
             idm_clip = predictions["idm_clip"].to(device)
             idm_meta = predictions["idm_meta"]
-            idm_traj = idm(idm_clip, meta=idm_meta).detach().float().cpu()[0]
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            idm_start = time.perf_counter()
+            idm_output = idm(idm_clip, meta=idm_meta)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            idm_seconds = time.perf_counter() - idm_start
+            print(f"[{index + 1}/{len(tokens)}] IDM inference: {idm_seconds:.4f} s", flush=True)
+            idm_traj = idm_output.detach().float().cpu()[0]
 
             gt_target = agent.get_target_builders()[0].compute_targets(scene)
             gt_traj = gt_target["trajectory"]
@@ -228,11 +238,38 @@ def main(cfg: DictConfig) -> None:
                     "idm_trajectory_from_generated_video": idm_traj,
                     "gt_trajectory": gt_traj,
                     "idm_meta": vars(idm_meta),
+                    "idm_inference_seconds": idm_seconds,
                 },
                 trajectory_dir / f"{stem}_trajectories.pt",
             )
             _save_video(generated_video, video_dir / f"{stem}_generated.mp4", fps=float(idm_meta.fps))
             manifest["tokens"].append(token)
+            manifest["idm_inference_seconds"].append(idm_seconds)
+
+    idm_times = manifest["idm_inference_seconds"]
+    if idm_times:
+        sorted_times = sorted(idm_times)
+        middle = len(sorted_times) // 2
+        median = (
+            sorted_times[middle]
+            if len(sorted_times) % 2
+            else (sorted_times[middle - 1] + sorted_times[middle]) / 2.0
+        )
+        steady_times = idm_times[1:] if len(idm_times) > 1 else idm_times
+        manifest["idm_timing_summary"] = {
+            "mean_seconds": sum(idm_times) / len(idm_times),
+            "median_seconds": median,
+            "min_seconds": min(idm_times),
+            "max_seconds": max(idm_times),
+            "mean_excluding_first_seconds": sum(steady_times) / len(steady_times),
+        }
+        print(
+            "IDM timing summary: "
+            f"mean={manifest['idm_timing_summary']['mean_seconds']:.4f}s, "
+            f"median={median:.4f}s, "
+            f"mean_excluding_first={manifest['idm_timing_summary']['mean_excluding_first_seconds']:.4f}s",
+            flush=True,
+        )
 
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=True),
