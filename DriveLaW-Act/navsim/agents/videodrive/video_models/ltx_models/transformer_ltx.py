@@ -592,7 +592,6 @@ class LTXVideoTransformer3DModel(
         return_action: bool = False,
         store_buffer=False,
         video_states_buffer=None,
-        use_video_states_buffer_for_action: bool = False,
         video_attention_mask: torch.Tensor = None,
         context_dict: Optional[Dict[str, torch.Tensor]] = None
     ) -> torch.Tensor:  
@@ -633,8 +632,6 @@ class LTXVideoTransformer3DModel(
             ### when video_states_buffer is None, store_buffer should be true to save video buffers
             if video_states_buffer is None:
                 assert store_buffer or return_video
-            if use_video_states_buffer_for_action and video_states_buffer is None:
-                raise ValueError("Frozen Action video features require a populated video_states_buffer.")
             action_temb_fused, action_embedded_timestep, action_rotary_emb, action_hidden_states = preprocessing_action_states(self, action_states, action_timestep,context_dict)
 
         for block_idx, block in enumerate(self.transformer_blocks):
@@ -657,11 +654,7 @@ class LTXVideoTransformer3DModel(
                     ### final_hidden_states:  video features, b (v t h w) c
                     ### action_hidden_states: random actions, b v c
                     ### 
-                    final_hidden_states = (
-                        video_states_buffer[block_idx]
-                        if use_video_states_buffer_for_action
-                        else hidden_states
-                    )
+                    final_hidden_states = hidden_states
                     action_hidden_states = self.action_blocks[block_idx](
                         hidden_states=action_hidden_states,
                         encoder_hidden_states=final_hidden_states,
@@ -686,11 +679,7 @@ class LTXVideoTransformer3DModel(
                     ### final_hidden_states:  video features, b (v t h w) c
                     ### action_hidden_states: random actions, b v c
                     ### 
-                    final_hidden_states = (
-                        video_states_buffer[block_idx]
-                        if use_video_states_buffer_for_action
-                        else hidden_states
-                    )
+                    final_hidden_states = hidden_states # rearrange(hidden_states, '(b v) l c -> b (v l) c', v=n_view)
                     
                     action_hidden_states = self.action_blocks[block_idx](
                         hidden_states=action_hidden_states,
