@@ -129,7 +129,7 @@ diffusion_model:
 
 
 use_color_jitter: true
-num_inference_step: 10
+num_inference_step: 5
 noisy_video: true
 
 # Video/IDM temporal alignment. The model generates at 8 FPS; the IDM
