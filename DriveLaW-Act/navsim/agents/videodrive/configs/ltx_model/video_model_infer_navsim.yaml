@@ -105,7 +105,7 @@ flow_mode_scale: 1.29
 pixel_wise_timestep: True
 
 diffusion_model:
-  model_path: /data/home/scyb955/run/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video/transformer/diffusion_pytorch_model.safetensors
+  model_path: /data/home/scyb955/run/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Act/diffusion_pytorch_model.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
