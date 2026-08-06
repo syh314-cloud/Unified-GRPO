@@ -913,6 +913,8 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         n_chunk: int = 1,
         context_dict: Optional[Dict[str, torch.Tensor]] = None,
         action_timestep: Optional[torch.LongTensor] = None,
+        action_num_inference_steps: Optional[int] = None,
+        freeze_action_video_features: bool = False,
         **kwargs,
     ):
         r"""
@@ -946,8 +948,10 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             num_frames (`int`, defaults to `161`):
                 The number of video frames to generate
             num_inference_steps (`int`, *optional*, defaults to 50):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
+                The number of Video denoising steps. More denoising steps usually lead to a higher quality image at
+                the expense of slower inference.
+            action_num_inference_steps (`int`, *optional*):
+                The number of Action denoising steps. Defaults to `num_inference_steps` for backward compatibility.
             timesteps (`List[int]`, *optional*):
                 Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
                 in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
@@ -1156,23 +1160,45 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
         NV = getattr(self.scheduler.config,        "num_train_timesteps", 1000)
         NA = getattr(self.scheduler_action.config, "num_train_timesteps", NV)
 
+        video_num_inference_steps = num_inference_steps
         if timesteps is None:
-            sigmas = linear_quadratic_schedule(num_inference_steps)
-            timesteps = sigmas * 1000
-        timesteps_a_idx = timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
-        timesteps_a, _                 = retrieve_timesteps(self.scheduler_action, num_inference_steps, device, timesteps_a_idx)
+            video_sigmas = linear_quadratic_schedule(video_num_inference_steps)
+            video_timestep_values = video_sigmas * 1000
+        else:
+            video_timestep_values = timesteps
+        timesteps, video_num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            video_num_inference_steps,
+            device,
+            video_timestep_values,
+        )
+
+        if return_action:
+            if action_num_inference_steps is None:
+                action_num_inference_steps = video_num_inference_steps
+            action_timestep_values = linear_quadratic_schedule(action_num_inference_steps) * 1000
+            timesteps_a, action_num_inference_steps = retrieve_timesteps(
+                self.scheduler_action,
+                action_num_inference_steps,
+                device,
+                action_timestep_values,
+            )
+        else:
+            timesteps_a = []
         sigmas = self.scheduler.sigmas
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        num_warmup_steps = max(
+            len(timesteps) - video_num_inference_steps * self.scheduler.order,
+            0,
+        )
 
         latent_sigma = None
         if denoise_strength < 1:
-            sigmas, timesteps, num_inference_steps = self.get_timesteps(
-                sigmas, timesteps, num_inference_steps, denoise_strength
+            sigmas, timesteps, video_num_inference_steps = self.get_timesteps(
+                sigmas, timesteps, video_num_inference_steps, denoise_strength
             )
             latent_sigma = sigmas[:1].repeat(batch_size * num_videos_per_prompt)
 
-        self._num_timesteps = len(timesteps)
+        self._num_timesteps = max(len(timesteps), len(timesteps_a) if return_action else 0)
 
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
@@ -1217,141 +1243,157 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             if context_dict is not None:
                 context_dict = {k: _dup_if_cfg(v, True) for k, v in context_dict.items()}
         
-        # 6. Denoising loop
+        # 6. Denoising loop. Video and Action use independent schedules. The
+        # first Video pass supplies a per-layer feature cache for all Action steps.
         video_states_buffer = None
-        for i, (t, t_a) in enumerate(zip(timesteps, timesteps_a)):
-                if self.interrupt:
-                    continue
+        ctx_tokens = None
+        video_step_count = len(timesteps) if return_video else int(return_action)
+        action_step_count = len(timesteps_a) if return_action else 0
+        total_step_count = max(video_step_count, action_step_count)
 
-                self._current_timestep = t
+        for i in range(total_step_count):
+            if self.interrupt:
+                continue
 
-                if image_cond_noise_scale > 0 and init_latents is not None:
-                    # Add timestep-dependent noise to the hard-conditioning latents
-                    # This helps with motion continuity, especially when conditioned on a single frame
-                    latents = self.add_noise_to_image_conditioning_latents(
-                        t / 1000.0,
-                        init_latents,
-                        latents,
-                        image_cond_noise_scale,
-                        conditioning_mask,
-                        generator,
-                    )
+            video_active = i < video_step_count
+            action_active = i < action_step_count
+            t = timesteps[i] if video_active else timesteps[-1]
+            t_a = timesteps_a[i] if action_active else None
+            self._current_timestep = t if video_active else t_a
 
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                if is_conditioning_image_or_video:
-                    conditioning_mask_model_input = (
-                        torch.cat([conditioning_mask, conditioning_mask])
-                        if self.do_classifier_free_guidance
-                        else conditioning_mask
-                    )
-                latent_model_input = latent_model_input.to(prompt_embeds.dtype)
+            if video_active and image_cond_noise_scale > 0 and init_latents is not None:
+                latents = self.add_noise_to_image_conditioning_latents(
+                    t / 1000.0,
+                    init_latents,
+                    latents,
+                    image_cond_noise_scale,
+                    conditioning_mask,
+                    generator,
+                )
 
-                compute_video = i == 0 or return_video
-                store_buffer = i == 0 and not return_video
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0], conditioning_mask_model_input.shape[1]).float()
-                if is_conditioning_image_or_video:
-                    cond_bin = (conditioning_mask_model_input > 0.5).float()   # 二值化成 0/1
-                    timestep = timestep * (1.0 - cond_bin)                     # 条件 token 直接置 0
+            latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+            if is_conditioning_image_or_video:
+                conditioning_mask_model_input = (
+                    torch.cat([conditioning_mask, conditioning_mask])
+                    if self.do_classifier_free_guidance
+                    else conditioning_mask
+                )
+                timestep_width = conditioning_mask_model_input.shape[1]
+            else:
+                conditioning_mask_model_input = None
+                timestep_width = latent_model_input.shape[1]
+            latent_model_input = latent_model_input.to(prompt_embeds.dtype)
 
-                if return_action:
-                    # (B, action_chunk)
-                    action_t_int = t_a.round().long()                            # ( ) 标量
-                    action_timesteps = action_t_int.expand(action_bs, action_chunk)  # (B,L)
-                    history_action_state_in = None
+            # The first pass computes Video features even for Action-only inference.
+            store_buffer = i == 0 and return_action
+            use_video_states_buffer_for_action = (
+                action_active
+                and i > 0
+                and (freeze_action_video_features or not video_active)
+            )
+            timestep = t.expand(latent_model_input.shape[0], timestep_width).float()
+            if is_conditioning_image_or_video:
+                cond_bin = (conditioning_mask_model_input > 0.5).float()
+                timestep = timestep * (1.0 - cond_bin)
 
-                    
-
-                    if self.do_classifier_free_guidance:
-                        actions_in = torch.cat([actions, actions], dim=0)
-                        action_timesteps = torch.cat([action_timesteps, action_timesteps], dim=0)
-                        history_action_state_in = (
-                            torch.cat([history_action_state, history_action_state], dim=0)
-                            if history_action_state is not None else None
-                        )    
-                    else:
-                        actions_in = actions
-                        history_action_state_in = history_action_state
-                    actions_in = actions_in.to(prompt_embeds.dtype)
-                    if history_action_state_in is not None:
-                        history_action_state_in = history_action_state_in.to(device=device, dtype=prompt_embeds.dtype)
+            if action_active:
+                action_t_int = t_a.round().long()
+                action_timesteps = action_t_int.expand(action_bs, action_chunk)
+                if self.do_classifier_free_guidance:
+                    actions_in = torch.cat([actions, actions], dim=0)
+                    action_timesteps = torch.cat([action_timesteps, action_timesteps], dim=0)
                 else:
-                    actions_in = None
-                    action_timesteps = None
-                    history_action_state_in = None
+                    actions_in = actions
+                actions_in = actions_in.to(prompt_embeds.dtype)
+            else:
+                actions_in = None
+                action_timesteps = None
 
+            with self.transformer.cache_context("cond_uncond"):
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timestep,
+                    encoder_attention_mask=prompt_attention_mask,
+                    num_frames=main_num_latent_frames,
+                    height=latent_height,
+                    width=latent_width,
+                    video_coords=video_coords,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                    action_states=actions_in,
+                    action_timestep=action_timesteps,
+                    return_video=video_active,
+                    return_action=action_active,
+                    video_states_buffer=video_states_buffer,
+                    store_buffer=store_buffer,
+                    use_video_states_buffer_for_action=use_video_states_buffer_for_action,
+                    context_dict=context_dict,
+                )[0]
+            if store_buffer:
+                video_states_buffer = noise_pred["video_states_buffer"]
 
-                with self.transformer.cache_context("cond_uncond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timestep,
-                        encoder_attention_mask=prompt_attention_mask,
-                        num_frames=main_num_latent_frames,
-                        height=latent_height,
-                        width=latent_width,
-                        video_coords=video_coords,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                        action_states=actions_in,
-                        action_timestep=action_timesteps,
-                        return_video=compute_video,
-                        return_action=return_action,
-                        video_states_buffer=video_states_buffer,
-                        store_buffer=store_buffer,
-                        context_dict=context_dict,
-                    )[0]
-                if store_buffer:
-                        video_states_buffer = noise_pred["video_states_buffer"]
-                
-                if return_action:
-                    if self.do_classifier_free_guidance:
-                        action_noise_pred_uncond, action_noise_pred = noise_pred["action"].float().chunk(2)
-                        action_noise_pred = action_noise_pred_uncond + self.guidance_scale * (action_noise_pred - action_noise_pred_uncond)
-                    else:
-                        action_noise_pred = noise_pred["action"].float()
-                    actions = self.scheduler_action.step(action_noise_pred, t_a, actions, return_dict=False)[0]
-                
-                i_ctx = 0  
+            if action_active:
+                if self.do_classifier_free_guidance:
+                    action_noise_pred_uncond, action_noise_pred = noise_pred["action"].float().chunk(2)
+                    action_noise_pred = action_noise_pred_uncond + self.guidance_scale * (
+                        action_noise_pred - action_noise_pred_uncond
+                    )
+                else:
+                    action_noise_pred = noise_pred["action"].float()
+                actions = self.scheduler_action.step(
+                    action_noise_pred,
+                    t_a,
+                    actions,
+                    return_dict=False,
+                )[0]
 
-                if compute_video:
-                    video_noise_pred = noise_pred["video"].float()
+            if video_active:
+                video_noise_pred = noise_pred["video"].float()
+                video_timestep = timestep
+                if self.do_classifier_free_guidance:
+                    video_noise_pred_uncond, video_noise_pred_text = video_noise_pred.chunk(2)
+                    video_noise_pred = video_noise_pred_uncond + self.guidance_scale * (
+                        video_noise_pred_text - video_noise_pred_uncond
+                    )
+                    video_timestep, _ = video_timestep.chunk(2)
+                    if self.guidance_rescale > 0:
+                        video_noise_pred = rescale_noise_cfg(
+                            video_noise_pred,
+                            video_noise_pred_text,
+                            guidance_rescale=self.guidance_rescale,
+                        )
+                denoised_latents = self.scheduler.step(
+                    video_noise_pred,
+                    t,
+                    latents,
+                    per_token_timesteps=video_timestep,
+                    return_dict=False,
+                )[0]
 
-                    if self.do_classifier_free_guidance:
-                        video_noise_pred_uncond, video_noise_pred_text = video_noise_pred.chunk(2)
-                        video_noise_pred = video_noise_pred_uncond + self.guidance_scale * (video_noise_pred_text - video_noise_pred_uncond)
-                        timestep, _ = timestep.chunk(2)
+                if i == 0:
+                    ctx_tokens = denoised_latents.detach()
 
-                        if self.guidance_rescale > 0:
-                            video_noise_pred = rescale_noise_cfg(
-                                video_noise_pred, video_noise_pred_text, guidance_rescale=self.guidance_rescale
-                            )
-                    denoised_latents = self.scheduler.step(
-                        video_noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
-                    )[0]
+                if is_conditioning_image_or_video:
+                    tokens_to_denoise_mask = (
+                        t / 1000 - 1e-6 < (1.0 - conditioning_mask)
+                    ).unsqueeze(-1)
+                    latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
+                else:
+                    latents = denoised_latents
 
-                    if i == i_ctx:
-                        ctx_tokens = denoised_latents.detach() 
-
-                    if is_conditioning_image_or_video:
-                        tokens_to_denoise_mask = (t / 1000 - 1e-6 < (1.0 - conditioning_mask)).unsqueeze(-1)
-                        latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
-                    else:
-                        latents = denoised_latents
-
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-                # call the callback, if provided
-                # if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                #     progress_bar.update()
+            if callback_on_step_end is not None:
+                callback_kwargs = {
+                    k: locals()[k] for k in callback_on_step_end_tensor_inputs
+                }
+                callback_outputs = callback_on_step_end(
+                    self,
+                    i,
+                    self._current_timestep,
+                    callback_kwargs,
+                )
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
 
 

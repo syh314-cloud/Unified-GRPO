@@ -333,7 +333,10 @@ class VideoDriveAgent(AbstractAgent):
         num_frames = int(
             getattr(args, "num_frames", condition_frames + required_future_frames + 1)
         )
-        num_steps = int(getattr(args, "num_inference_step", 20))
+        action_num_steps = int(getattr(args, "num_inference_step", 5))
+        video_num_steps = int(
+            getattr(args, "video_num_inference_step", action_num_steps)
+        )
         seed = int(getattr(args, "seed", 42))
         negative_prompt = getattr(
             args,
@@ -366,7 +369,8 @@ class VideoDriveAgent(AbstractAgent):
             "condition_frames": condition_frames,
             "num_waypoints": num_waypoints,
             "waypoint_interval_s": waypoint_interval_s,
-            "num_steps": num_steps,
+            "action_num_steps": action_num_steps,
+            "video_num_steps": video_num_steps,
             "seed": seed,
             "action_chunk": action_chunk,
             "action_dim": action_dim,
@@ -381,7 +385,6 @@ class VideoDriveAgent(AbstractAgent):
         cond_tensor: torch.Tensor,
         preds: Dict[str, torch.Tensor],
         video_fps: int,
-        condition_frames: int,
         num_waypoints: int,
         waypoint_interval_s: float,
     ) -> Dict[str, object]:
@@ -396,26 +399,20 @@ class VideoDriveAgent(AbstractAgent):
 
         if video_fps <= 0:
             raise ValueError(f"video_fps must be positive, got {video_fps}")
-        if condition_frames < 0 or condition_frames >= generated_video.shape[1]:
-            raise ValueError(
-                f"condition_frames={condition_frames} is invalid for generated video with "
-                f"{generated_video.shape[1]} frames"
-            )
-
-        # Remove the conditioning prefix. The remaining frames are ordered at
-        # video_fps, while IDM waypoints are ordered every waypoint_interval_s.
-        future_video = generated_video[:, condition_frames:].contiguous()
         target_times = torch.arange(1, num_waypoints + 1, dtype=torch.float32) * waypoint_interval_s
         # Frame 0 is the first future sample, so t seconds maps to ceil(t*fps)-1.
         target_indices = torch.ceil(target_times * video_fps).long() - 1
         max_index = int(target_indices.max().item())
-        if future_video.shape[1] <= max_index:
+        if generated_video.shape[1] <= max_index:
             raise ValueError(
                 "Generated video is too short for IDM temporal alignment: "
                 f"need {max_index + 1} future frames at {video_fps} FPS for "
                 f"{num_waypoints} waypoints every {waypoint_interval_s:.3f}s, "
-                f"but got {future_video.shape[1]}. Increase num_frames."
+                f"but got {generated_video.shape[1]}. Increase num_frames."
             )
+        # Keep the first 4 seconds at 8 FPS for video output. IDM receives the
+        # eight frames at 0.5-second waypoint timestamps from the same sequence.
+        future_video = generated_video[:, :max_index + 1].contiguous()
         generated_future_video = future_video[:, target_indices].contiguous()
 
         batch_size = generated_future_video.shape[0]
@@ -430,7 +427,8 @@ class VideoDriveAgent(AbstractAgent):
         return {
             "actions_tensor": actions,
             "actions": actions.numpy(),
-            "generated_video": generated_video,
+            "decoded_video": generated_video,
+            "generated_video": future_video,
             "generated_future_video": generated_future_video,
             "generated_future_video_bcthw": generated_future_video_bcthw,
             "idm_clip": idm_clip,
@@ -463,7 +461,8 @@ class VideoDriveAgent(AbstractAgent):
             conditions=[infer_inputs["condition"]],
             prompt=infer_inputs["prompt"],
             negative_prompt=infer_inputs["negative_prompt"],
-            num_inference_steps=infer_inputs["num_steps"],
+            num_inference_steps=infer_inputs["action_num_steps"],
+            action_num_inference_steps=infer_inputs["action_num_steps"],
             guidance_scale=1.0,
             height=infer_inputs["height"],
             width=infer_inputs["width"],
@@ -518,7 +517,8 @@ class VideoDriveAgent(AbstractAgent):
             conditions=[infer_inputs["condition"]],
             prompt=infer_inputs["prompt"],
             negative_prompt=infer_inputs["negative_prompt"],
-            num_inference_steps=infer_inputs["num_steps"],
+            num_inference_steps=infer_inputs["video_num_steps"],
+            action_num_inference_steps=infer_inputs["action_num_steps"],
             guidance_scale=1.0,
             height=infer_inputs["height"],
             width=infer_inputs["width"],
@@ -535,6 +535,9 @@ class VideoDriveAgent(AbstractAgent):
             noise_seed=generator_seed,
             pixel_wise_timestep=True,
             image_cond_noise_scale=0.0,
+            freeze_action_video_features=bool(
+                getattr(self.args, "freeze_action_video_features", True)
+            ),
         )
         torch.cuda.synchronize()
         timing["pipe_infer"] = time.perf_counter() - t1
@@ -544,7 +547,6 @@ class VideoDriveAgent(AbstractAgent):
             infer_inputs["cond_tensor"],
             preds,
             video_fps=infer_inputs["video_fps"],
-            condition_frames=infer_inputs["condition_frames"],
             num_waypoints=infer_inputs["num_waypoints"],
             waypoint_interval_s=infer_inputs["waypoint_interval_s"],
         )
@@ -588,6 +590,7 @@ class VideoDriveAgent(AbstractAgent):
         merged: Dict[str, object] = {
             "actions_tensor": torch.cat([r["actions_tensor"] for r in rollouts], dim=0),
             "actions": np.concatenate([r["actions"] for r in rollouts], axis=0),
+            "decoded_video": torch.cat([r["decoded_video"] for r in rollouts], dim=0),
             "generated_video": torch.cat([r["generated_video"] for r in rollouts], dim=0),
             "generated_future_video": torch.cat([r["generated_future_video"] for r in rollouts], dim=0),
             "generated_future_video_bcthw": torch.cat(
@@ -709,6 +712,8 @@ class VideoDriveAgent(AbstractAgent):
         result: Dict[str, object] = {
             "actions": rollout["actions"][0],
             "actions_tensor": rollout["actions_tensor"][0],
+            "decoded_video": rollout["decoded_video"][0:1],
+            "generated_video": rollout["generated_video"][0:1],
             "generated_future_video": rollout["generated_future_video"][0:1],
             "generated_future_video_bcthw": rollout["generated_future_video_bcthw"][0:1],
             "idm_clip": rollout["idm_clip"][0:1],

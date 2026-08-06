@@ -129,8 +129,10 @@ diffusion_model:
 
 
 use_color_jitter: true
-num_inference_step: 5
+num_inference_step: 5  # Action denoising steps
+video_num_inference_step: 30  # Video denoising steps
 noisy_video: true
+freeze_action_video_features: true
 
 # Video/IDM temporal alignment. The model generates at 8 FPS; the IDM
 # receives samples at 0.5 s, so the agent temporally resamples the future

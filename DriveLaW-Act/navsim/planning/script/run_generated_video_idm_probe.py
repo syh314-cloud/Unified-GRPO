@@ -203,9 +203,21 @@ def main(cfg: DictConfig) -> None:
         "num_samples": len(tokens),
         "idm_checkpoint": str(probe.idm_checkpoint),
         "world_model_config": str(cfg.agent.config_file),
+        "video_num_inference_steps": int(agent.args.video_num_inference_step),
+        "action_num_inference_steps": int(agent.args.num_inference_step),
+        "freeze_action_video_features": bool(agent.args.freeze_action_video_features),
+        "video_fps": int(agent.args.frame_rate),
         "tokens": [],
         "idm_inference_seconds": [],
     }
+    print(
+        "Joint inference: "
+        f"Video={manifest['video_num_inference_steps']} steps, "
+        f"Action={manifest['action_num_inference_steps']} steps, "
+        f"freeze_action_video_features={manifest['freeze_action_video_features']}, "
+        f"video_fps={manifest['video_fps']}",
+        flush=True,
+    )
 
     with torch.inference_mode():
         for index, token in enumerate(tokens):
@@ -216,9 +228,18 @@ def main(cfg: DictConfig) -> None:
             predictions = agent.forward(features)
 
             world_traj = predictions["actions_tensor"].detach().float().cpu()
-            generated_video = predictions["generated_future_video"].detach().float().cpu()
+            decoded_video = predictions["decoded_video"].detach().float().cpu()
+            generated_video = predictions["generated_video"].detach().float().cpu()
             idm_clip = predictions["idm_clip"].to(device)
             idm_meta = predictions["idm_meta"]
+            if "decoded_video_frames" not in manifest:
+                manifest["decoded_video_frames"] = int(decoded_video.shape[1])
+                manifest["saved_video_frames"] = int(generated_video.shape[1])
+                print(
+                    f"Video frames: decoded={decoded_video.shape[1]}, "
+                    f"saved={generated_video.shape[1]}",
+                    flush=True,
+                )
 
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -248,7 +269,11 @@ def main(cfg: DictConfig) -> None:
                 },
                 trajectory_dir / f"{stem}_trajectories.pt",
             )
-            _save_video(generated_video, video_dir / f"{stem}_generated.mp4", fps=float(idm_meta.fps))
+            _save_video(
+                generated_video,
+                video_dir / f"{stem}_generated.mp4",
+                fps=float(agent.args.frame_rate),
+            )
             manifest["tokens"].append(token)
             manifest["idm_inference_seconds"].append(idm_seconds)
 
