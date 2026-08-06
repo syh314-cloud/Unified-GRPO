@@ -385,8 +385,10 @@ class VideoDriveAgent(AbstractAgent):
         cond_tensor: torch.Tensor,
         preds: Dict[str, torch.Tensor],
         video_fps: int,
+        condition_frames: int,
         num_waypoints: int,
         waypoint_interval_s: float,
+        build_idm_clip: bool,
     ) -> Dict[str, object]:
         actions = self._postprocess_action_outputs(preds["actions"])
         generated_video = preds["videos"]
@@ -399,20 +401,37 @@ class VideoDriveAgent(AbstractAgent):
 
         if video_fps <= 0:
             raise ValueError(f"video_fps must be positive, got {video_fps}")
+        temporal_ratio = int(self.pipe.vae_temporal_compression_ratio)
+        condition_pixel_frames = (condition_frames - 1) * temporal_ratio + 1
+        if generated_video.shape[1] <= condition_pixel_frames:
+            raise ValueError(
+                f"Decoded video has {generated_video.shape[1]} frames, but the "
+                f"{condition_frames} conditioning latents occupy the first "
+                f"{condition_pixel_frames} decoded frames."
+            )
+        future_video = generated_video[:, condition_pixel_frames:].contiguous()
+
+        rollout: Dict[str, object] = {
+            "actions_tensor": actions,
+            "actions": actions.numpy(),
+            "decoded_video": generated_video,
+            "generated_video": future_video,
+            "condition_pixel_frames": condition_pixel_frames,
+        }
+        if not build_idm_clip:
+            return rollout
+
         target_times = torch.arange(1, num_waypoints + 1, dtype=torch.float32) * waypoint_interval_s
         # Frame 0 is the first future sample, so t seconds maps to ceil(t*fps)-1.
         target_indices = torch.ceil(target_times * video_fps).long() - 1
         max_index = int(target_indices.max().item())
-        if generated_video.shape[1] <= max_index:
+        if future_video.shape[1] <= max_index:
             raise ValueError(
                 "Generated video is too short for IDM temporal alignment: "
                 f"need {max_index + 1} future frames at {video_fps} FPS for "
                 f"{num_waypoints} waypoints every {waypoint_interval_s:.3f}s, "
-                f"but got {generated_video.shape[1]}. Increase num_frames."
+                f"but got {future_video.shape[1]}. Increase the number of future latents."
             )
-        # Keep the first 4 seconds at 8 FPS for video output. IDM receives the
-        # eight frames at 0.5-second waypoint timestamps from the same sequence.
-        future_video = generated_video[:, :max_index + 1].contiguous()
         generated_future_video = future_video[:, target_indices].contiguous()
 
         batch_size = generated_future_video.shape[0]
@@ -424,16 +443,13 @@ class VideoDriveAgent(AbstractAgent):
             future_interval_s=self._trajectory_sampling.interval_length,
         )
 
-        return {
-            "actions_tensor": actions,
-            "actions": actions.numpy(),
-            "decoded_video": generated_video,
-            "generated_video": future_video,
+        rollout.update({
             "generated_future_video": generated_future_video,
             "generated_future_video_bcthw": generated_future_video_bcthw,
             "idm_clip": idm_clip,
             "idm_meta": idm_meta,
-        }
+        })
+        return rollout
 
     @staticmethod
     def _postprocess_action_outputs(actions: torch.Tensor) -> torch.Tensor:
@@ -497,12 +513,14 @@ class VideoDriveAgent(AbstractAgent):
         features: Dict[str, torch.Tensor],
         sample_time: int = 8,
         seed: Optional[int] = None,
+        build_idm_clip: bool = False,
     ) -> Dict[str, object]:
         """
         Jointly sample `sample_time` action/video rollouts from the same conditioning input.
 
         This is the GRPO-ready entry point for scheme A:
-          one pipe.infer call -> aligned actions + generated videos + IDM clips
+          one pipe.infer call -> aligned actions and generated videos, with
+          optional IDM clip construction.
         """
         device = self.device
         infer_inputs = self._prepare_joint_infer_inputs(features)
@@ -547,8 +565,10 @@ class VideoDriveAgent(AbstractAgent):
             infer_inputs["cond_tensor"],
             preds,
             video_fps=infer_inputs["video_fps"],
+            condition_frames=infer_inputs["condition_frames"],
             num_waypoints=infer_inputs["num_waypoints"],
             waypoint_interval_s=infer_inputs["waypoint_interval_s"],
+            build_idm_clip=build_idm_clip,
         )
         rollout["timing"] = timing
         return rollout
@@ -571,7 +591,12 @@ class VideoDriveAgent(AbstractAgent):
 
         images = features["images"]
         if images.ndim == 4:
-            rollout = self.sample_joint_rollouts(features, sample_time=sample_time, seed=seed)
+            rollout = self.sample_joint_rollouts(
+                features,
+                sample_time=sample_time,
+                seed=seed,
+                build_idm_clip=True,
+            )
             rollout["batch_size"] = 1
             rollout["group_size"] = sample_time
             return rollout
@@ -584,7 +609,12 @@ class VideoDriveAgent(AbstractAgent):
             single_features = self._slice_feature_sample(features, batch_index)
             single_seed = None if seed is None else int(seed) + batch_index
             rollouts.append(
-                self.sample_joint_rollouts(single_features, sample_time=sample_time, seed=single_seed)
+                self.sample_joint_rollouts(
+                    single_features,
+                    sample_time=sample_time,
+                    seed=single_seed,
+                    build_idm_clip=True,
+                )
             )
 
         merged: Dict[str, object] = {
@@ -714,10 +744,7 @@ class VideoDriveAgent(AbstractAgent):
             "actions_tensor": rollout["actions_tensor"][0],
             "decoded_video": rollout["decoded_video"][0:1],
             "generated_video": rollout["generated_video"][0:1],
-            "generated_future_video": rollout["generated_future_video"][0:1],
-            "generated_future_video_bcthw": rollout["generated_future_video_bcthw"][0:1],
-            "idm_clip": rollout["idm_clip"][0:1],
-            "idm_meta": rollout["idm_meta"],
+            "condition_pixel_frames": rollout["condition_pixel_frames"],
         }
         return result
 
