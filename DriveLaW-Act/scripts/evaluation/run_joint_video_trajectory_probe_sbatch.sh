@@ -16,13 +16,13 @@ export NAVSIM_DEVKIT_ROOT="${ROOT}"
 export NAVSIM_EXP_ROOT=/data/home/scyb955/run/sunyuhan/projects/exp
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export NUPLAN_MAP_VERSION="${NUPLAN_MAP_VERSION:-nuplan-maps-v1.0}"
-: "${OPENSCENE_DATA_ROOT:?Export OPENSCENE_DATA_ROOT before submitting this job}"
+export OPENSCENE_DATA_ROOT="${OPENSCENE_DATA_ROOT:-/data/home/scyb955/run/sunyuhan/navsim_workspace/dataset}"
 export NUPLAN_MAPS_ROOT="${NUPLAN_MAPS_ROOT:-${OPENSCENE_DATA_ROOT}/maps}"
 
 cd "${ROOT}"
 
 python navsim/planning/script/run_joint_video_trajectory_probe.py \
-  train_test_split="${TRAIN_TEST_SPLIT:-navtest}" \
+  train_test_split="${TRAIN_TEST_SPLIT:-navtrain}" \
   agent=videodrive_agent \
   agent.config_file="${ROOT}/navsim/agents/videodrive/configs/ltx_model/video_model_infer_navsim.yaml" \
   +probe.output_dir="${NAVSIM_EXP_ROOT}/joint_video_trajectory_probe_2s" \
