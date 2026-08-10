@@ -20,6 +20,7 @@ CONDITION_VIDEO="${INFER_ROOT}/demo/condition_videos/scene_0001_conditioning.mp4
 PROMPT="${INFER_ROOT}/demo/prompts/scene_0001_prompt.txt"
 OUTPUT_VIDEO="${OUTPUT_ROOT}/scene_0001_future_24frames.mp4"
 STATS_FILE="${OUTPUT_ROOT}/frame_statistics.txt"
+BUNDLED_DIFFUSERS="${INFER_ROOT}/diffusers/src/diffusers"
 
 # These are the exact values in DriveLaW-Video/Infer/README.md.
 NUM_FRAMES=33
@@ -29,18 +30,13 @@ NUM_INFERENCE_STEPS=30
 
 count_video_frames() {
   local video_path=$1
-  python - "${INFER_ROOT}" "${video_path}" <<'PY'
+  (cd /tmp && python - "${video_path}" <<'PY'
 import sys
-from pathlib import Path
-
-infer_root = Path(sys.argv[1])
-video_path = sys.argv[2]
-sys.path.insert(0, str(infer_root / "diffusers" / "src"))
-
 from diffusers.utils import load_video
 
-print(len(load_video(video_path)))
+print(len(load_video(sys.argv[1])))
 PY
+  )
 }
 
 for required_path in \
@@ -54,8 +50,77 @@ for required_path in \
   fi
 done
 
+if [[ -d "${BUNDLED_DIFFUSERS}/models" ]]; then
+  echo "Bundled diffusers models directory unexpectedly exists; remove the compatibility setup." >&2
+  exit 1
+fi
+
 mkdir -p "${OUTPUT_ROOT}"
 INPUT_FRAME_COUNT=$(count_video_frames "${CONDITION_VIDEO}")
+
+readarray -t INSTALLED_DIFFUSERS_INFO < <(
+  cd /tmp
+  python - <<'PY'
+import os
+import diffusers
+
+print(diffusers.__version__)
+print(os.path.dirname(diffusers.__file__))
+PY
+)
+INSTALLED_DIFFUSERS_VERSION=${INSTALLED_DIFFUSERS_INFO[0]}
+INSTALLED_DIFFUSERS_ROOT=${INSTALLED_DIFFUSERS_INFO[1]}
+INSTALLED_MODELS="${INSTALLED_DIFFUSERS_ROOT}/models"
+
+if [[ ! -d "${INSTALLED_MODELS}" ]]; then
+  echo "Installed diffusers models directory not found: ${INSTALLED_MODELS}" >&2
+  exit 1
+fi
+
+BUNDLED_DIFFUSERS_VERSION=$(python - "${BUNDLED_DIFFUSERS}/__init__.py" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], "r", encoding="utf-8").read())
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__version__":
+                print(ast.literal_eval(node.value))
+                raise SystemExit
+raise RuntimeError("Bundled diffusers __version__ was not found")
+PY
+)
+
+# The official repository accidentally excludes src/diffusers/models via its
+# root models/ gitignore rule. Build a temporary package that keeps every
+# bundled source file unchanged and supplies only that missing directory from
+# the complete diffusers installation in this environment.
+RUNTIME_ROOT=$(mktemp -d "/tmp/drivelaw-video-${SLURM_JOB_ID:-manual}.XXXXXX")
+trap 'rm -rf "${RUNTIME_ROOT}"' EXIT
+mkdir -p "${RUNTIME_ROOT}/diffusers/src/diffusers"
+ln -s "${INFER_ROOT}/infer.py" "${RUNTIME_ROOT}/infer.py"
+
+for source_path in "${BUNDLED_DIFFUSERS}"/*; do
+  entry_name=$(basename "${source_path}")
+  ln -s "${source_path}" "${RUNTIME_ROOT}/diffusers/src/diffusers/${entry_name}"
+done
+ln -s "${INSTALLED_MODELS}" "${RUNTIME_ROOT}/diffusers/src/diffusers/models"
+
+python - "${RUNTIME_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+
+runtime_root = Path(sys.argv[1])
+sys.path.insert(0, str(runtime_root / "diffusers" / "src"))
+from diffusers import LTXConditionPipeline
+from diffusers.models import AutoencoderKLLTXVideo, LTXVideoTransformer3DModel
+
+print("Temporary official pipeline import: OK")
+print("Pipeline:", LTXConditionPipeline)
+print("VAE:", AutoencoderKLLTXVideo)
+print("Transformer:", LTXVideoTransformer3DModel)
+PY
 
 TEMPORAL_RATIO=$(python - "${MODEL_ROOT}/vae/config.json" <<'PY'
 import json
@@ -77,16 +142,18 @@ Condition video file: ${CONDITION_VIDEO}
 Input frames measured by official diffusers load_video: ${INPUT_FRAME_COUNT}
 Pipeline requested pixel frames before trimming: ${NUM_FRAMES}
 VAE temporal compression ratio: ${TEMPORAL_RATIO}
+Bundled diffusers version: ${BUNDLED_DIFFUSERS_VERSION}
+Installed diffusers models version: ${INSTALLED_DIFFUSERS_VERSION}
 Main latent temporal frames: ${MAIN_LATENT_FRAMES}
 Condition latent temporal frames: ${CONDITION_LATENT_FRAMES}
 Condition frames removed by official infer.py: ${CONDITION_FRAMES}
 Expected saved future frames: $((NUM_FRAMES - CONDITION_FRAMES))
 EOF
 
-cd "${INFER_ROOT}"
+cd "${RUNTIME_ROOT}"
 
 # Keep this invocation aligned with the minimal command in Infer/README.md.
-python infer.py \
+python "${RUNTIME_ROOT}/infer.py" \
   --condition_video "${CONDITION_VIDEO}" \
   --prompt "${PROMPT}" \
   --output_path "${OUTPUT_VIDEO}" \
