@@ -12,6 +12,7 @@ import hydra
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from PIL import Image
 
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.script.run_generated_video_idm_probe import (
@@ -22,6 +23,29 @@ from navsim.planning.script.run_generated_video_idm_probe import (
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+def _save_decoded_frames(video: torch.Tensor, output_dir: Path) -> int:
+    """Save every VAE-decoded frame without assigning temporal semantics."""
+    video = video.detach().float().cpu()
+    if video.ndim == 5:
+        if video.shape[0] != 1:
+            raise ValueError(f"Expected one decoded video, got shape {tuple(video.shape)}")
+        video = video[0]
+    if video.ndim != 4 or video.shape[1] not in (1, 3):
+        raise ValueError(f"Expected decoded video shaped (T,C,H,W), got {tuple(video.shape)}")
+    if video.min() < 0:
+        video = (video + 1.0) * 0.5
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_frame in output_dir.glob("frame_*.png"):
+        old_frame.unlink()
+    for frame_index, frame in enumerate(video):
+        frame_uint8 = (
+            frame.permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+        )
+        Image.fromarray(frame_uint8).save(output_dir / f"frame_{frame_index:04d}.png")
+    return int(video.shape[0])
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
@@ -37,8 +61,9 @@ def main(cfg: DictConfig) -> None:
     )
     video_dir = output_dir / "videos"
     frame_dir = output_dir / "frames"
+    raw_decoded_frame_dir = output_dir / "raw_decoded_frames"
     trajectory_dir = output_dir / "trajectories"
-    for directory in (video_dir, frame_dir, trajectory_dir):
+    for directory in (video_dir, frame_dir, raw_decoded_frame_dir, trajectory_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -121,6 +146,15 @@ def main(cfg: DictConfig) -> None:
             stem = f"{index:04d}_{token}"
             torch.save(decoded_video, frame_dir / f"{stem}_decoded_frames.pt")
             torch.save(future_video, frame_dir / f"{stem}_future_frames.pt")
+            raw_frame_count = _save_decoded_frames(
+                decoded_video,
+                raw_decoded_frame_dir / stem,
+            )
+            _save_video(
+                decoded_video,
+                video_dir / f"{stem}_raw_decoded_all_frames.mp4",
+                fps=float(agent.args.frame_rate),
+            )
             torch.save(
                 {
                     "token": token,
@@ -128,6 +162,7 @@ def main(cfg: DictConfig) -> None:
                     "gt_trajectory": gt_trajectory,
                     "condition_pixel_frames": condition_pixel_frames,
                     "decoded_video_frames": int(decoded_video.shape[1]),
+                    "raw_decoded_png_frames": raw_frame_count,
                     "future_video_frames": int(future_video.shape[1]),
                     "inference_seconds": inference_seconds,
                 },
@@ -144,6 +179,7 @@ def main(cfg: DictConfig) -> None:
                 {
                     "token": token,
                     "decoded_video_frames": int(decoded_video.shape[1]),
+                    "raw_decoded_png_frames": raw_frame_count,
                     "condition_pixel_frames": condition_pixel_frames,
                     "future_video_frames": int(future_video.shape[1]),
                     "inference_seconds": inference_seconds,
