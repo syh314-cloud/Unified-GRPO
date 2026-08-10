@@ -29,16 +29,18 @@ NUM_INFERENCE_STEPS=30
 
 count_video_frames() {
   local video_path=$1
-  local count
-  count=$(ffprobe -v error -count_frames -select_streams v:0 \
-    -show_entries stream=nb_read_frames \
-    -of default=noprint_wrappers=1:nokey=1 "${video_path}")
-  if [[ -z "${count}" || "${count}" == "N/A" ]]; then
-    count=$(ffprobe -v error -select_streams v:0 \
-      -show_entries stream=nb_frames \
-      -of default=noprint_wrappers=1:nokey=1 "${video_path}")
-  fi
-  printf '%s\n' "${count}"
+  python - "${INFER_ROOT}" "${video_path}" <<'PY'
+import sys
+from pathlib import Path
+
+infer_root = Path(sys.argv[1])
+video_path = sys.argv[2]
+sys.path.insert(0, str(infer_root / "diffusers" / "src"))
+
+from diffusers.utils import load_video
+
+print(len(load_video(video_path)))
+PY
 }
 
 for required_path in \
@@ -51,11 +53,6 @@ for required_path in \
     exit 1
   fi
 done
-
-command -v ffprobe >/dev/null || {
-  echo "ffprobe is required to count frames" >&2
-  exit 1
-}
 
 mkdir -p "${OUTPUT_ROOT}"
 INPUT_FRAME_COUNT=$(count_video_frames "${CONDITION_VIDEO}")
@@ -77,7 +74,7 @@ cat >"${STATS_FILE}" <<EOF
 DriveLaW-Video official README inference frame statistics
 =========================================================
 Condition video file: ${CONDITION_VIDEO}
-Input frames measured by ffprobe: ${INPUT_FRAME_COUNT}
+Input frames measured by official diffusers load_video: ${INPUT_FRAME_COUNT}
 Pipeline requested pixel frames before trimming: ${NUM_FRAMES}
 VAE temporal compression ratio: ${TEMPORAL_RATIO}
 Main latent temporal frames: ${MAIN_LATENT_FRAMES}
@@ -104,7 +101,7 @@ python infer.py \
 
 OUTPUT_FRAME_COUNT=$(count_video_frames "${OUTPUT_VIDEO}")
 cat >>"${STATS_FILE}" <<EOF
-Output frames measured by ffprobe: ${OUTPUT_FRAME_COUNT}
+Output frames measured by official diffusers load_video: ${OUTPUT_FRAME_COUNT}
 Output video: ${OUTPUT_VIDEO}
 EOF
 
