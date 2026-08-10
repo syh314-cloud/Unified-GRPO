@@ -389,6 +389,7 @@ class VideoDriveAgent(AbstractAgent):
         num_waypoints: int,
         waypoint_interval_s: float,
         build_idm_clip: bool,
+        extract_future_video: bool = True,
     ) -> Dict[str, object]:
         actions = self._postprocess_action_outputs(preds["actions"])
         generated_video = preds["videos"]
@@ -398,6 +399,16 @@ class VideoDriveAgent(AbstractAgent):
         generated_video = generated_video.detach().float().cpu()  # (G, F, C, H, W)
         if generated_video.ndim != 5:
             raise ValueError(f"Expected generated video shape (B,F,C,H,W), got {tuple(generated_video.shape)}")
+
+        rollout: Dict[str, object] = {
+            "actions_tensor": actions,
+            "actions": actions.numpy(),
+            "decoded_video": generated_video,
+        }
+        if not extract_future_video:
+            if build_idm_clip:
+                raise ValueError("build_idm_clip requires extract_future_video=True")
+            return rollout
 
         if video_fps <= 0:
             raise ValueError(f"video_fps must be positive, got {video_fps}")
@@ -411,13 +422,10 @@ class VideoDriveAgent(AbstractAgent):
             )
         future_video = generated_video[:, condition_pixel_frames:].contiguous()
 
-        rollout: Dict[str, object] = {
-            "actions_tensor": actions,
-            "actions": actions.numpy(),
-            "decoded_video": generated_video,
+        rollout.update({
             "generated_video": future_video,
             "condition_pixel_frames": condition_pixel_frames,
-        }
+        })
         if not build_idm_clip:
             return rollout
 
@@ -514,6 +522,7 @@ class VideoDriveAgent(AbstractAgent):
         sample_time: int = 8,
         seed: Optional[int] = None,
         build_idm_clip: bool = False,
+        extract_future_video: bool = True,
     ) -> Dict[str, object]:
         """
         Jointly sample `sample_time` action/video rollouts from the same conditioning input.
@@ -569,6 +578,7 @@ class VideoDriveAgent(AbstractAgent):
             num_waypoints=infer_inputs["num_waypoints"],
             waypoint_interval_s=infer_inputs["waypoint_interval_s"],
             build_idm_clip=build_idm_clip,
+            extract_future_video=extract_future_video,
         )
         rollout["timing"] = timing
         return rollout
