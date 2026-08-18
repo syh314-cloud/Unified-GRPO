@@ -84,7 +84,8 @@ from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 
 # ---------------- Config constants ----------------
-CONFIG_PATH = "path/to/DriveLaW-Act/navsim/planning/script/config/training"
+# Hydra resolves this path relative to this module, not the process cwd.
+CONFIG_PATH = "../../planning/script/config/training"
 CONFIG_NAME = "default_training"
 
 logger = get_logger("unified_trainer")
