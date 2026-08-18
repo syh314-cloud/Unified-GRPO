@@ -52,7 +52,13 @@ class JointVideoActionTrainer(UnifiedTrainer):
         if target_clip.shape[2] != 9:
             raise ValueError(f"Expected a 9-frame target clip, got {target_clip.shape[2]}")
 
-        memory_latents, future_latents = get_latents(self.vae, history, target_clip)
+        memory_latents, future_latents = get_latents(
+            self.vae,
+            history,
+            target_clip,
+            device=accel.device,
+            dtype=weight_dtype,
+        )
         latent_height = height // self.SPATIAL_DOWN_RATIO
         latent_width = width // self.SPATIAL_DOWN_RATIO
 
@@ -79,7 +85,9 @@ class JointVideoActionTrainer(UnifiedTrainer):
 
         clean_latents = torch.cat([memory_latents, future_latents], dim=2)
         latent_frames = clean_latents.shape[2]
-        clean_latents = rearrange(clean_latents, "b c f h w -> b (f h w) c")
+        clean_latents = rearrange(
+            clean_latents, "b c f h w -> b (f h w) c"
+        ).to(dtype=weight_dtype)
 
         condition_tokens = history_frames * latent_height * latent_width
         conditioning_mask = torch.zeros(
@@ -93,6 +101,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
 
     def _video_flow_batch(self, clean_latents, conditioning_mask):
         sigmas = self._timestep_sampler.sample_for(clean_latents).clamp(0.0, 1.0)
+        sigmas = sigmas.to(device=clean_latents.device, dtype=clean_latents.dtype)
         noise = torch.randn_like(clean_latents)
         sigma = sigmas.view(-1, 1, 1)
         noisy_latents = (1.0 - sigma) * clean_latents + sigma * noise
@@ -106,6 +115,8 @@ class JointVideoActionTrainer(UnifiedTrainer):
 
     @staticmethod
     def _masked_video_loss(prediction, target, conditioning_mask):
+        prediction = prediction.float()
+        target = target.float()
         target_mask = (~conditioning_mask).unsqueeze(-1).to(prediction.dtype)
         denominator = target_mask.sum() * prediction.shape[-1]
         return ((prediction - target).pow(2) * target_mask).sum() / denominator.clamp_min(1)
@@ -139,6 +150,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
         actions = batch["actions"].to(accel.device, dtype=weight_dtype)
         action_noise = randn_tensor(actions.shape, device=accel.device, dtype=weight_dtype)
         action_sigmas = self._timestep_sampler.sample_for(actions).clamp(0.0, 1.0)
+        action_sigmas = action_sigmas.to(device=actions.device, dtype=actions.dtype)
         noisy_actions = (
             (1.0 - action_sigmas.view(-1, 1, 1)) * actions
             + action_sigmas.view(-1, 1, 1) * action_noise
@@ -151,6 +163,12 @@ class JointVideoActionTrainer(UnifiedTrainer):
             "vel": batch["vel"].to(accel.device, dtype=weight_dtype),
             "acc": batch["acc"].to(accel.device, dtype=weight_dtype),
         }
+        if noisy_video.dtype != weight_dtype or noisy_actions.dtype != weight_dtype:
+            raise TypeError(
+                "Action forward dtype mismatch: "
+                f"video={noisy_video.dtype}, action={noisy_actions.dtype}, "
+                f"expected={weight_dtype}"
+            )
         prediction = self._forward_pass(
             latents=noisy_video,
             timesteps=video_timesteps,
@@ -167,7 +185,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
             action_dim=actions.shape[-1],
             context_dict=context_dict,
         )["action"]
-        return F.mse_loss(prediction, action_noise - actions)
+        return F.mse_loss(prediction.float(), (action_noise - actions).float())
 
     def train(self):
         logger.info("Starting joint Video DiT adaptation with frozen Action DiT")
@@ -195,21 +213,31 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     text_conditions = get_text_conditions(
                         self.tokenizer, self.text_encoder, captions
                     )
-                    prompt_embeds = text_conditions["prompt_embeds"]
-                    prompt_attention_mask = text_conditions["prompt_attention_mask"]
+                    prompt_embeds = text_conditions["prompt_embeds"].to(
+                        accel.device, dtype=weight_dtype
+                    )
+                    prompt_attention_mask = text_conditions["prompt_attention_mask"].to(
+                        accel.device
+                    )
                     dropout = (
                         torch.rand(clean_latents.shape[0], device=accel.device)
                         < float(self.args.caption_dropout_p)
                     ).view(-1, 1, 1)
                     prompt_embeds = torch.where(
                         dropout,
-                        self.uncond_prompt_embeds.repeat(clean_latents.shape[0], 1, 1),
+                        self.uncond_prompt_embeds.to(
+                            accel.device, dtype=weight_dtype
+                        ).repeat(clean_latents.shape[0], 1, 1),
                         prompt_embeds,
                     )
 
                     video_input, video_timesteps, video_target = self._video_flow_batch(
                         clean_latents, conditioning_mask
                     )
+                    if video_input.dtype != weight_dtype:
+                        raise TypeError(
+                            f"Video forward dtype is {video_input.dtype}, expected {weight_dtype}"
+                        )
                     video_prediction = self._forward_pass(
                         latents=video_input,
                         timesteps=video_timesteps,
@@ -227,7 +255,6 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     )
                     if not torch.isfinite(loss_video):
                         raise FloatingPointError(f"Non-finite video loss: {loss_video.item()}")
-                    accel.backward(video_loss_scale * loss_video)
 
                     loss_action = self._action_preservation_loss(
                         batch,
@@ -242,7 +269,22 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     )
                     if not torch.isfinite(loss_action):
                         raise FloatingPointError(f"Non-finite action loss: {loss_action.item()}")
-                    accel.backward(action_loss_scale * loss_action)
+
+                    loss = video_loss_scale * loss_video + action_loss_scale * loss_action
+                    if step == 0 and epoch == 0 and accel.is_main_process:
+                        model_dtype = next(self.diffusion_model.parameters()).dtype
+                        logger.info(
+                            "Forward contract: latents=%s/%s, prompt=%s/%s, "
+                            "video_pred=%s/%s, model_dtype=%s",
+                            tuple(clean_latents.shape),
+                            clean_latents.dtype,
+                            tuple(prompt_embeds.shape),
+                            prompt_embeds.dtype,
+                            tuple(video_prediction.shape),
+                            video_prediction.dtype,
+                            model_dtype,
+                        )
+                    accel.backward(loss)
 
                     if accel.sync_gradients and accel.distributed_type != DistributedType.DEEPSPEED:
                         logs["grad_norm"] = accel.clip_grad_norm_(
