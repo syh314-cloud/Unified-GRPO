@@ -820,7 +820,10 @@ class UnifiedTrainer:
             self.state.accelerator.prepare(self.diffusion_model, self.optimizer, self.train_dataloader, self.val_dataloader, self.lr_scheduler)
 
     def prepare_trackers(self):
-        self.state.accelerator.init_trackers("navsim_train", config=self.args.__dict__)
+        # Passing config makes older TensorBoard versions call add_hparams(),
+        # which is incompatible with NumPy >= 2.0 (np.string_ was removed).
+        # Scalar logging remains fully enabled without the hparams payload.
+        self.state.accelerator.init_trackers("navsim_train")
 
     def _create_first_frame_conditioning_mask(
         self, batch_size: int, sequence_length: int, height: int, width: int, device: torch.device
