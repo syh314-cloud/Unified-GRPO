@@ -686,8 +686,8 @@ class UnifiedTrainer:
         if self.args.mixed_precision == "fp16":
             cast_training_params([self.diffusion_model], dtype=torch.float32)
 
-        # if self.args.gradient_checkpointing:
-        #     self.diffusion_model.enable_gradient_checkpointing()
+        if self.args.gradient_checkpointing:
+            self.diffusion_model.enable_gradient_checkpointing()
 
         if self.args.allow_tf32 and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -699,6 +699,13 @@ class UnifiedTrainer:
                 p.requires_grad = ('action_' in name)
             elif train_mode == "video_only":
                 p.requires_grad = ('action_' not in name)
+            elif train_mode == "video_action_adapt":
+                is_action_parameter = (
+                    'action_' in name
+                    or name == 'plan_anchor'
+                    or name.startswith('traj_scorer.')
+                )
+                p.requires_grad = not is_action_parameter
             elif train_mode in ("all", "action_full"):
                 p.requires_grad = True
             else:
@@ -735,7 +742,7 @@ class UnifiedTrainer:
                     f.write(_format_param(n, p) + "\n")
             logger.info(f"Wrote detailed parameter list to {out_txt}")
 
-        self.state.learning_rate = 3e-5
+        self.state.learning_rate = float(self.args.lr)
         # if self.cfg.scale_lr:
         #     self.state.learning_rate = (
         #         self.state.learning_rate
@@ -748,12 +755,12 @@ class UnifiedTrainer:
         self.optimizer = get_optimizer(
             params_to_optimize=params_to_optimize,
             optimizer_name=self.args.optimizer,
-            learning_rate=3e-5,
-            beta1=0.9,
-            beta2=0.95,
-            beta3=0.999,
-            epsilon=1e-8,
-            weight_decay=1e-5,
+            learning_rate=self.state.learning_rate,
+            beta1=float(self.args.beta1),
+            beta2=float(self.args.beta2),
+            beta3=float(self.args.beta3),
+            epsilon=float(self.args.epsilon),
+            weight_decay=float(self.args.weight_decay),
             use_8bit=getattr(self.args, "optimizer_8bit", False),
             use_torchao=getattr(self.args, "optimizer_torchao", False),
         )
