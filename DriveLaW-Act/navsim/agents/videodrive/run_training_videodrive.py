@@ -96,7 +96,7 @@ logger.setLevel(LOG_LEVEL)
 # ===========================
 # Prompt builder
 # ===========================
-NAV_CMDS = ['turn left', 'go straight', 'turn right']
+NAV_CMDS = ["turn left", "go straight", "turn right", "unknown"]
 
 def _round_up_to(x: int, m: int) -> int:
     return (x + m - 1) // m * m
@@ -146,7 +146,11 @@ def one_hot_to_cmd(one_hot) -> str:
         one_hot = one_hot.tolist()
     else:
         one_hot = list(one_hot)
-    return next((NAV_CMDS[i] for i, v in enumerate(one_hot) if v == 1), "unknown")
+    active_indices = [i for i, value in enumerate(one_hot) if float(value) > 0.5]
+    if len(active_indices) != 1:
+        return "unknown"
+    index = active_indices[0]
+    return NAV_CMDS[index] if index < len(NAV_CMDS) else "unknown"
 
 def build_prompt_fixed(hist_xyh: torch.Tensor,
                        high_cmd_one_hot,
