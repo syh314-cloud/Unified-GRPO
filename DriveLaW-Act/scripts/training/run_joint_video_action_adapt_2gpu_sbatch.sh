@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J dlw_vact_4g
+#SBATCH -J dlw_vact_2g
 #SBATCH -p gpu_a800
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH -t 3-00:00:00
-#SBATCH -o /data/home/scyb955/slurm_logs/dlw_vact_4g.%j.out
-#SBATCH -e /data/home/scyb955/slurm_logs/dlw_vact_4g.%j.err
+#SBATCH -o /data/home/scyb955/slurm_logs/dlw_vact_2g.%j.out
+#SBATCH -e /data/home/scyb955/slurm_logs/dlw_vact_2g.%j.err
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ export TOKENIZERS_PARALLELISM=false
 
 cd "${REPO}"
 
-torchrun --standalone --nproc_per_node=4 \
+torchrun --standalone --nproc_per_node=2 \
   navsim/agents/videodrive/run_training_joint_video_action.py \
   agent=videodrive_agent \
   agent.config_file="${CONFIG_PATH}" \
