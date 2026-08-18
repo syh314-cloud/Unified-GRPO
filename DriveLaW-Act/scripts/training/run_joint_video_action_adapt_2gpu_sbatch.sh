@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO=/data/run01/scyb955/sunyuhan/projects/SD/DriveLaW-Act
-OUTPUT_ROOT=/data/home/scyb955/run/sunyuhan/projects/exp/drivelaw_joint_video_action_adapt
+OUTPUT_ROOT=/data/home/scyb955/run/sunyuhan/projects/exp/drivelaw_joint_video_action_adapt_2gpu
 CACHE_PATH=/data/run01/scyb955/sunyuhan/projects/SD/DriveLaW-Act/videodrive_agent_cache_dir_final_front
 CONFIG_PATH=${REPO}/navsim/agents/videodrive/configs/ltx_model/video_model_joint_video_action_adapt.yaml
 
@@ -36,7 +36,7 @@ torchrun --standalone --nproc_per_node=2 \
   navsim/agents/videodrive/run_training_joint_video_action.py \
   agent=videodrive_agent \
   agent.config_file="${CONFIG_PATH}" \
-  experiment_name=drivelaw_joint_video_action_adapt \
+  experiment_name=drivelaw_joint_video_action_adapt_2gpu \
   train_test_split=navtrain \
   cache_path="${CACHE_PATH}" \
   output_dir="${OUTPUT_ROOT}" \

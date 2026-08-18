@@ -27,9 +27,9 @@ future_video_frames: 8
 video_loss_scale: 1.0
 action_loss_scale: 1.0
 
-# One full pass over 139,284 samples with global batch size 2.
-train_steps: 69642
-train_epochs: 100
+# Derive updates from dataset size and distributed global batch size.
+train_steps: null
+train_epochs: 1
 steps_to_save: 5000
 steps_to_log: 10
 steps_to_val: 5000
