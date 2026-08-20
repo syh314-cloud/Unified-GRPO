@@ -159,11 +159,16 @@ def main(cfg: DictConfig) -> None:
 
         future_roundtrip = _decode_training_latents(vae, future_latents, dtype)
         joined_roundtrip = _decode_training_latents(vae, joined_latents, dtype)
-        history_roundtrip = _decode_training_latents(
-            vae, rearrange(memory_latents, "b c m h w -> (b m) c 1 h w"), dtype
-        )
-        history_roundtrip = rearrange(
-            history_roundtrip, "(b m) c 1 h w -> b c m h w", b=1, m=4
+        # Diffusers 0.35.2 has a batch>1 slicing bug in LTX VAE decode.
+        # Decode each independently encoded history latent as batch size 1.
+        history_roundtrip = torch.cat(
+            [
+                _decode_training_latents(
+                    vae, memory_latents[:, :, index : index + 1], dtype
+                )
+                for index in range(memory_latents.shape[2])
+            ],
+            dim=2,
         )
 
     frame_counts = {
