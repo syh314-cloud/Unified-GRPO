@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import hydra
@@ -14,6 +15,11 @@ from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from yaml import Loader, load
+
+# The legacy trainer imports its local helper package as top-level `utils`.
+# Put that package ahead of navsim/planning/script/utils.py before importing it.
+VIDEODRIVE_DIR = Path(__file__).resolve().parents[2] / "agents" / "videodrive"
+sys.path.insert(0, str(VIDEODRIVE_DIR))
 
 from navsim.agents.videodrive.run_training_videodrive import (
     CacheOnlyDatasetLazyIO,
