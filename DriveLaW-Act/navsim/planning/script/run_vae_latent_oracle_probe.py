@@ -25,12 +25,24 @@ from navsim.agents.videodrive.run_training_videodrive import (
     CacheOnlyDatasetLazyIO,
     navsim_genie_collate_fn,
 )
-from navsim.agents.videodrive.utils.data_utils import decode_latents, get_latents
+from navsim.agents.videodrive.utils.data_utils import get_latents
 from navsim.agents.videodrive.utils.model_loader import load_vae
 
 
 CONFIG_PATH = "config/training"
 CONFIG_NAME = "default_training"
+
+
+@torch.no_grad()
+def _decode_training_latents(vae, latents: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Invert the exact normalization used by get_latents(), then decode."""
+    mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    latents = (latents * std + mean).to(dtype=dtype)
+    timestep = None
+    if vae.config.timestep_conditioning:
+        timestep = torch.zeros(latents.shape[0], device=latents.device, dtype=dtype)
+    return vae.decode(latents, temb=timestep, return_dict=False)[0].clamp(-1, 1)
 
 
 def _save_video_and_frames(video: torch.Tensor, root: Path, fps: int) -> int:
@@ -145,12 +157,10 @@ def main(cfg: DictConfig) -> None:
         )
         joined_latents = torch.cat([memory_latents, future_latents], dim=2)
 
-        future_roundtrip = decode_latents(vae, future_latents, dtype=dtype)
-        joined_roundtrip = decode_latents(vae, joined_latents, dtype=dtype)
-        history_roundtrip = decode_latents(
-            vae,
-            rearrange(memory_latents, "b c m h w -> (b m) c 1 h w"),
-            dtype=dtype,
+        future_roundtrip = _decode_training_latents(vae, future_latents, dtype)
+        joined_roundtrip = _decode_training_latents(vae, joined_latents, dtype)
+        history_roundtrip = _decode_training_latents(
+            vae, rearrange(memory_latents, "b c m h w -> (b m) c 1 h w"), dtype
         )
         history_roundtrip = rearrange(
             history_roundtrip, "(b m) c 1 h w -> b c m h w", b=1, m=4
