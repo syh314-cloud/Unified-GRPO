@@ -216,7 +216,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
             # Match the official Stage-3 forward call: VAE latents are
             # produced in fp32 and cast only at the DiT input boundary.
             latents=noisy_video.to(accel.device, dtype=weight_dtype),
-            timesteps=video_timesteps,
+            timesteps=timesteps,
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
             latent_frames=latent_frames,
