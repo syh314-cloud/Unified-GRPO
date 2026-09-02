@@ -212,14 +212,10 @@ class JointVideoActionTrainer(UnifiedTrainer):
             prompt_embeds * ~dropout_mask
         )
 
-        if noisy_video.dtype != weight_dtype or noisy_actions.dtype != weight_dtype:
-            raise TypeError(
-                "Action forward dtype mismatch: "
-                f"video={noisy_video.dtype}, action={noisy_actions.dtype}, "
-                f"expected={weight_dtype}"
-            )
         prediction = self._forward_pass(
-            latents=noisy_video,
+            # Match the official Stage-3 forward call: VAE latents are
+            # produced in fp32 and cast only at the DiT input boundary.
+            latents=noisy_video.to(accel.device, dtype=weight_dtype),
             timesteps=video_timesteps,
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
