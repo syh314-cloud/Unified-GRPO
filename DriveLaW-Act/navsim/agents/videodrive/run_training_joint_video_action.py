@@ -16,6 +16,7 @@ from navsim.agents.videodrive.run_training_videodrive import (
     CONFIG_PATH,
     UnifiedTrainer,
     free_memory,
+    gen_noise_from_condition_frame_latent,
     get_latents,
     get_memory_statistics,
     get_text_conditions,
@@ -26,7 +27,7 @@ from navsim.agents.videodrive.run_training_videodrive import (
 
 
 class JointVideoActionTrainer(UnifiedTrainer):
-    """Two-pass trainer for real future-video targets and frozen Action DiT."""
+    """Joint video/action trainer with real future-video supervision."""
 
     def _prepare_video_latents(self, batch, weight_dtype):
         accel = self.state.accelerator
@@ -121,36 +122,74 @@ class JointVideoActionTrainer(UnifiedTrainer):
         denominator = target_mask.sum() * prediction.shape[-1]
         return ((prediction - target).pow(2) * target_mask).sum() / denominator.clamp_min(1)
 
-    def _action_preservation_loss(
-        self,
-        batch,
-        clean_latents,
-        conditioning_mask,
-        prompt_embeds,
-        prompt_attention_mask,
-        latent_frames,
-        latent_height,
-        latent_width,
-        weight_dtype,
-    ):
+    def _paper_stage3_action_loss(self, batch, weight_dtype):
+        """Run the official Stage-3 Action forward and flow-matching target unchanged.
+
+        The additional video loss is evaluated in a separate forward pass. Keeping
+        this branch independent preserves the official Action noise construction,
+        conditioning layout, timestep sampling, and target ``noise - actions``.
+        """
         accel = self.state.accelerator
 
-        # This reproduces the first Video denoising state used to condition the
-        # official Action path: history is clean and every future token is noise.
-        video_noise = torch.randn_like(clean_latents)
-        noisy_video = torch.where(
-            conditioning_mask.unsqueeze(-1), clean_latents, video_noise
+        video = batch["video"].to(accel.device, dtype=weight_dtype).contiguous()
+        batch_size, _, views, history_frames, height, width = video.shape
+        if views != 1 or history_frames != 4:
+            raise ValueError(
+                "Official Stage-3 Action branch expects one view and four history frames, "
+                f"got {tuple(video.shape)}"
+            )
+        memory = rearrange(video, "b c v t h w -> (b v) c t h w")
+
+        # This is intentionally the same Action-conditioning construction as
+        # the author's Stage-3 runner: one future frame repeated to form the
+        # 9-frame VAE clip used only to establish the latent layout.
+        future_video = batch["future_video"].to(accel.device, dtype=weight_dtype).contiguous()
+        future_video = rearrange(future_video, "b c v t h w -> (b v) c t h w")
+        future_clip = future_video[:, :, :1].repeat(1, 1, 9, 1, 1)
+        memory_latents, future_latents = get_latents(self.vae, memory, future_clip)
+
+        latent_frames = 4 + 9 // self.TEMPORAL_DOWN_RATIO + 1
+        latent_height = height // self.SPATIAL_DOWN_RATIO
+        latent_width = width // self.SPATIAL_DOWN_RATIO
+        memory_latents = rearrange(
+            memory_latents,
+            "(b m) (h w) c -> b c m h w",
+            b=batch_size,
+            m=4,
+            h=latent_height,
         )
-        video_timesteps = torch.where(
-            conditioning_mask,
-            torch.zeros_like(conditioning_mask, dtype=torch.long),
-            torch.full_like(conditioning_mask, 1000, dtype=torch.long),
+        future_latents = rearrange(
+            future_latents,
+            "b (f h w) c -> b c f h w",
+            b=batch_size,
+            h=latent_height,
+            w=latent_width,
         )
+        latents = torch.cat((memory_latents, future_latents), dim=2)
+        latents = rearrange(latents, "b c f h w -> b (f h w) c")
+
+        noise, conditioning_mask, condition_indicator = gen_noise_from_condition_frame_latent(
+            memory_latents,
+            latent_frames,
+            latent_height,
+            latent_width,
+            noise_to_condition_frames=0.0,
+        )
+        sigmas = self._timestep_sampler.sample_for(noise)
+        timesteps = torch.round(sigmas * 1000.0).long()
+        if self.args.pixel_wise_timestep:
+            timesteps = timesteps.unsqueeze(-1) * (1 - conditioning_mask.long())
+        else:
+            timesteps = timesteps.unsqueeze(-1) * (1 - condition_indicator)
+
+        sigma = sigmas.reshape(-1, 1, 1).repeat(1, 1, latents.size(-1))
+        if self.args.return_action and self.args.noisy_video:
+            sigma = torch.full_like(sigma, 1.0)
+        noisy_video = (1.0 - sigma) * latents + sigma * noise
 
         actions = batch["actions"].to(accel.device, dtype=weight_dtype)
         action_noise = randn_tensor(actions.shape, device=accel.device, dtype=weight_dtype)
         action_sigmas = self._timestep_sampler.sample_for(actions).clamp(0.0, 1.0)
-        action_sigmas = action_sigmas.to(device=actions.device, dtype=actions.dtype)
         noisy_actions = (
             (1.0 - action_sigmas.view(-1, 1, 1)) * actions
             + action_sigmas.view(-1, 1, 1) * action_noise
@@ -163,6 +202,16 @@ class JointVideoActionTrainer(UnifiedTrainer):
             "vel": batch["vel"].to(accel.device, dtype=weight_dtype),
             "acc": batch["acc"].to(accel.device, dtype=weight_dtype),
         }
+        captions = batch["caption"]
+        text_conditions = get_text_conditions(self.tokenizer, self.text_encoder, captions)
+        prompt_embeds = text_conditions["prompt_embeds"]
+        prompt_attention_mask = text_conditions["prompt_attention_mask"]
+        dropout_factor = torch.rand(batch_size, device=accel.device, dtype=weight_dtype)
+        dropout_mask = (dropout_factor < self.args.caption_dropout_p).unsqueeze(1).unsqueeze(2)
+        prompt_embeds = self.uncond_prompt_embeds.repeat(batch_size, 1, 1) * dropout_mask + (
+            prompt_embeds * ~dropout_mask
+        )
+
         if noisy_video.dtype != weight_dtype or noisy_actions.dtype != weight_dtype:
             raise TypeError(
                 "Action forward dtype mismatch: "
@@ -177,7 +226,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
             latent_frames=latent_frames,
             latent_height=latent_height,
             latent_width=latent_width,
-            return_video=True,
+            return_video=self.args.return_video or self.args.return_action,
             return_action=True,
             video_attention_mask=None,
             action_timestep=action_timesteps,
@@ -188,7 +237,10 @@ class JointVideoActionTrainer(UnifiedTrainer):
         return F.mse_loss(prediction.float(), (action_noise - actions).float())
 
     def train(self):
-        logger.info("Starting joint Video DiT adaptation with frozen Action DiT")
+        logger.info(
+            "Starting joint video/action training (train_mode=%s)",
+            self.args.train_mode,
+        )
         logger.info("Memory before: %s", json.dumps(get_memory_statistics(), indent=2))
         accel = self.state.accelerator
         weight_dtype = self.state.weight_dtype
@@ -201,6 +253,12 @@ class JointVideoActionTrainer(UnifiedTrainer):
             for step, batch in enumerate(self.train_dataloader):
                 logs = {}
                 with accel.accumulate(self.diffusion_model):
+                    # Run this first so Action uses the same random-operation order
+                    # and flow-matching construction as the official Stage-3 runner.
+                    loss_action = self._paper_stage3_action_loss(batch, weight_dtype)
+                    if not torch.isfinite(loss_action):
+                        raise FloatingPointError(f"Non-finite action loss: {loss_action.item()}")
+
                     (
                         clean_latents,
                         conditioning_mask,
@@ -255,20 +313,6 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     )
                     if not torch.isfinite(loss_video):
                         raise FloatingPointError(f"Non-finite video loss: {loss_video.item()}")
-
-                    loss_action = self._action_preservation_loss(
-                        batch,
-                        clean_latents,
-                        conditioning_mask,
-                        prompt_embeds,
-                        prompt_attention_mask,
-                        latent_frames,
-                        latent_height,
-                        latent_width,
-                        weight_dtype,
-                    )
-                    if not torch.isfinite(loss_action):
-                        raise FloatingPointError(f"Non-finite action loss: {loss_action.item()}")
 
                     loss = video_loss_scale * loss_video + action_loss_scale * loss_action
                     if step == 0 and epoch == 0 and accel.is_main_process:
