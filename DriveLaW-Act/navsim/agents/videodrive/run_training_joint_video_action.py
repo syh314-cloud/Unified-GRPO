@@ -226,7 +226,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
             return_action=True,
             video_attention_mask=None,
             action_timestep=action_timesteps,
-            action_states=noisy_actions,
+            action_states=noisy_actions.to(accel.device, dtype=weight_dtype),
             action_dim=actions.shape[-1],
             context_dict=context_dict,
         )["action"]
