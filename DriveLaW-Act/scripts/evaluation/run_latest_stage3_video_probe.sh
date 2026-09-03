@@ -9,11 +9,15 @@ TRAIN_OUTPUT_ROOT=${TRAIN_OUTPUT_ROOT:?Set TRAIN_OUTPUT_ROOT to the Stage-3 trai
 PROBE_LIMIT=${PROBE_LIMIT:-1}
 TRAIN_TEST_SPLIT=${TRAIN_TEST_SPLIT:-navtrain}
 
-CKPT=$(find "$TRAIN_OUTPUT_ROOT" -type f \
-  -path '*/step_*/diffusion_pytorch_model.safetensors' \
-  -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+if [ -n "${CHECKPOINT_PATH:-}" ]; then
+  CKPT="$CHECKPOINT_PATH"
+else
+  CKPT=$(find "$TRAIN_OUTPUT_ROOT" -type f \
+    -path '*/step_*/diffusion_pytorch_model.safetensors' \
+    -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+fi
 
-if [ -z "$CKPT" ]; then
+if [ -z "$CKPT" ] || [ ! -f "$CKPT" ]; then
   echo "No completed Stage-3 checkpoint found below: $TRAIN_OUTPUT_ROOT" >&2
   echo "The first checkpoint is written at step_1000." >&2
   exit 1
