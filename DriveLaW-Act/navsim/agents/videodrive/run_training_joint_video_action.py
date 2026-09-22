@@ -24,10 +24,18 @@ from navsim.agents.videodrive.run_training_videodrive import (
     randn_tensor,
     unwrap_model,
 )
+from navsim.agents.videodrive.utils.data_utils import unpack_latents
 
 
 class JointVideoActionTrainer(UnifiedTrainer):
     """Joint video/action trainer with real future-video supervision."""
+
+    def prepare_models(self):
+        """Load the Stage-2 VAE as a frozen, differentiable decoder."""
+        super().prepare_models()
+        self.vae.eval()
+        for parameter in self.vae.parameters():
+            parameter.requires_grad_(False)
 
     def _prepare_video_latents(self, batch, weight_dtype):
         accel = self.state.accelerator
@@ -98,7 +106,14 @@ class JointVideoActionTrainer(UnifiedTrainer):
             device=clean_latents.device,
         )
         conditioning_mask[:, :condition_tokens] = True
-        return clean_latents, conditioning_mask, latent_frames, latent_height, latent_width
+        return (
+            clean_latents,
+            conditioning_mask,
+            latent_frames,
+            latent_height,
+            latent_width,
+            target_clip,
+        )
 
     def _video_flow_batch(self, clean_latents, conditioning_mask):
         sigmas = self._timestep_sampler.sample_for(clean_latents).clamp(0.0, 1.0)
@@ -112,7 +127,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
         timesteps = self._create_timesteps_from_conditioning_mask(
             conditioning_mask, torch.round(sigmas * 1000.0).long()
         )
-        return noisy_latents, timesteps, noise - clean_latents
+        return noisy_latents, timesteps, noise - clean_latents, sigma
 
     @staticmethod
     def _masked_video_loss(prediction, target, conditioning_mask):
@@ -121,6 +136,69 @@ class JointVideoActionTrainer(UnifiedTrainer):
         target_mask = (~conditioning_mask).unsqueeze(-1).to(prediction.dtype)
         denominator = target_mask.sum() * prediction.shape[-1]
         return ((prediction - target).pow(2) * target_mask).sum() / denominator.clamp_min(1)
+
+    def _decode_normalized_future_latents(self, future_latents: torch.Tensor) -> torch.Tensor:
+        """Decode only the two temporally-consistent target latents.
+
+        The four history latents are independent single-frame encodings and must
+        never be concatenated with target latents before temporal VAE decoding.
+        VAE weights remain frozen, while gradients flow to ``future_latents``.
+        """
+        vae_dtype = next(self.vae.parameters()).dtype
+        future_latents = future_latents.to(dtype=vae_dtype)
+        mean = self.vae.latents_mean.to(
+            device=future_latents.device, dtype=future_latents.dtype
+        ).view(1, -1, 1, 1, 1)
+        std = self.vae.latents_std.to(
+            device=future_latents.device, dtype=future_latents.dtype
+        ).view(1, -1, 1, 1, 1)
+        unnormalized_latents = future_latents * std + mean
+        decode_timestep = torch.zeros(
+            unnormalized_latents.shape[0],
+            device=unnormalized_latents.device,
+            dtype=unnormalized_latents.dtype,
+        )
+        return self.vae.decode(
+            unnormalized_latents, decode_timestep, return_dict=False
+        )[0]
+
+    def _future_rgb_loss(
+        self,
+        video_input: torch.Tensor,
+        video_prediction: torch.Tensor,
+        sigma: torch.Tensor,
+        target_clip: torch.Tensor,
+        latent_height: int,
+        latent_width: int,
+    ) -> torch.Tensor:
+        """Reconstruct the 2 Hz current-plus-future clip from target latents.
+
+        Flow matching predicts ``noise - clean_latents``.  Therefore
+        ``z0_hat = z_sigma - sigma * v_hat`` reconstructs the clean target
+        latents at the sampled noise level.  Two LTX temporal latents decode to
+        exactly nine frames, which align with current + eight NAVSIM future
+        images.  The memory latents are excluded from this decode by design.
+        """
+        target_frames = 2
+        target_tokens = target_frames * latent_height * latent_width
+        predicted_clean = video_input - sigma * video_prediction
+        predicted_future_packed = predicted_clean[:, -target_tokens:]
+        predicted_future_latents = unpack_latents(
+            predicted_future_packed,
+            num_frames=target_frames,
+            height=latent_height,
+            width=latent_width,
+        )
+        decoded_prediction = self._decode_normalized_future_latents(
+            predicted_future_latents
+        )
+        if decoded_prediction.shape != target_clip.shape:
+            raise ValueError(
+                "Future VAE decode must produce the 2 Hz nine-frame target clip; "
+                f"got prediction={tuple(decoded_prediction.shape)}, "
+                f"target={tuple(target_clip.shape)}"
+            )
+        return F.l1_loss(decoded_prediction.float(), target_clip.float())
 
     def _paper_stage3_action_loss(self, batch, weight_dtype):
         """Run the official Stage-3 Action forward and flow-matching target unchanged.
@@ -241,6 +319,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
         accel = self.state.accelerator
         weight_dtype = self.state.weight_dtype
         video_loss_scale = float(self.args.video_loss_scale)
+        video_rgb_loss_scale = float(self.args.video_rgb_loss_scale)
         action_loss_scale = float(self.args.action_loss_scale)
         global_step = 0
 
@@ -261,6 +340,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
                         latent_frames,
                         latent_height,
                         latent_width,
+                        target_clip,
                     ) = self._prepare_video_latents(batch, weight_dtype)
 
                     captions = batch["caption"]
@@ -285,7 +365,7 @@ class JointVideoActionTrainer(UnifiedTrainer):
                         prompt_embeds,
                     )
 
-                    video_input, video_timesteps, video_target = self._video_flow_batch(
+                    video_input, video_timesteps, video_target, video_sigma = self._video_flow_batch(
                         clean_latents, conditioning_mask
                     )
                     if video_input.dtype != weight_dtype:
@@ -304,9 +384,18 @@ class JointVideoActionTrainer(UnifiedTrainer):
                         return_action=False,
                         video_attention_mask=None,
                     )["video"]
-                    loss_video = self._masked_video_loss(
+                    loss_video_flow = self._masked_video_loss(
                         video_prediction, video_target, conditioning_mask
                     )
+                    loss_video_rgb = self._future_rgb_loss(
+                        video_input,
+                        video_prediction,
+                        video_sigma,
+                        target_clip,
+                        latent_height,
+                        latent_width,
+                    )
+                    loss_video = loss_video_flow + video_rgb_loss_scale * loss_video_rgb
                     if not torch.isfinite(loss_video):
                         raise FloatingPointError(f"Non-finite video loss: {loss_video.item()}")
 
@@ -338,6 +427,8 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     self.optimizer.zero_grad()
 
                 reduced_video = accel.reduce(loss_video.detach(), reduction="mean")
+                reduced_video_flow = accel.reduce(loss_video_flow.detach(), reduction="mean")
+                reduced_video_rgb = accel.reduce(loss_video_rgb.detach(), reduction="mean")
                 reduced_action = accel.reduce(loss_action.detach(), reduction="mean")
                 reduced_total = video_loss_scale * reduced_video + action_loss_scale * reduced_action
                 if accel.sync_gradients:
@@ -347,6 +438,8 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     {
                         "loss": reduced_total.item(),
                         "loss_video": reduced_video.item(),
+                        "loss_video_flow": reduced_video_flow.item(),
+                        "loss_video_rgb": reduced_video_rgb.item(),
                         "loss_action": reduced_action.item(),
                         "lr": self.lr_scheduler.get_last_lr()[0],
                     }
@@ -355,10 +448,12 @@ class JointVideoActionTrainer(UnifiedTrainer):
                     accel.log(logs, step=global_step)
                     if accel.is_main_process:
                         logger.info(
-                            "[step %d] total=%.5f video=%.5f action=%.5f lr=%.3g",
+                            "[step %d] total=%.5f video=%.5f flow=%.5f rgb=%.5f action=%.5f lr=%.3g",
                             global_step,
                             logs["loss"],
                             logs["loss_video"],
+                            logs["loss_video_flow"],
+                            logs["loss_video_rgb"],
                             logs["loss_action"],
                             logs["lr"],
                         )

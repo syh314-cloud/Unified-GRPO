@@ -27,6 +27,9 @@ return_video: true
 train_mode: action_full
 future_video_frames: 8
 video_loss_scale: 1.0
+# Keep the flow-matching objective and add an RGB reconstruction auxiliary
+# loss after decoding only the two 2 Hz target latents (9 frames total).
+video_rgb_loss_scale: 0.1
 action_loss_scale: 1.0
 
 # Paper Stage-3 optimization schedule.
