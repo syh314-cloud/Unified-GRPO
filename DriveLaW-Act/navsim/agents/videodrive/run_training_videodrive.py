@@ -521,6 +521,10 @@ class UnifiedTrainer:
             grad_accum = self.cfg.gradient_accumulation_steps
             train_batch_size = per_device_bs * world_size * grad_accum
             self.args.deepspeed["train_batch_size"] = train_batch_size
+            # DeepSpeed otherwise defaults to one accumulation step even when
+            # Accelerator is configured differently. Keep both engines on the
+            # same effective global batch.
+            self.args.deepspeed["gradient_accumulation_steps"] = grad_accum
             ds_plugin = DeepSpeedPlugin(hf_ds_config=self.args.deepspeed,
                                         gradient_accumulation_steps=grad_accum)
 
