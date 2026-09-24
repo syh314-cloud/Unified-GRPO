@@ -46,7 +46,7 @@ from .idm_xvo_style import (
 # ----------------------------------------------------
 from torch.utils.tensorboard import SummaryWriter
 from .utils import init_logging, import_custom_class, save_video
-from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
+from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video, decode_latents
 from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 
@@ -459,6 +459,34 @@ class VideoDriveAgent(AbstractAgent):
         })
         return rollout
 
+    @torch.inference_mode()
+    def _decode_joint_future_target_latents(self, final_latents: torch.Tensor) -> torch.Tensor:
+        """Decode only the two temporally valid target latents from joint inference.
+
+        The joint model denoises six latent frames: four separately encoded
+        history-memory frames followed by two temporal target frames.  The
+        memory frames are transformer conditions, not a continuous temporal-VAE
+        clip, so decoding all six together produces an invalid 41-frame video.
+        The two target latents decode to the 2 Hz current-plus-eight-future
+        NAVSIM clip used by the RGB training loss.
+        """
+        if final_latents.ndim != 5 or final_latents.shape[2] < 2:
+            raise ValueError(
+                "Expected final joint latents shaped (B,C,F,H,W) with at least "
+                f"two target frames, got {tuple(final_latents.shape)}"
+            )
+
+        future_latents = final_latents[:, :, -2:].contiguous()
+        vae_dtype = next(self.vae.parameters()).dtype
+        decoded = decode_latents(self.vae, future_latents, dtype=vae_dtype)
+        decoded = self.pipe.video_processor.postprocess_video(decoded, output_type="pt")
+        if decoded.ndim != 5 or decoded.shape[1] != 9:
+            raise ValueError(
+                "Two target temporal latents must decode to a 9-frame clip, "
+                f"got {tuple(decoded.shape)}"
+            )
+        return decoded
+
     @staticmethod
     def _postprocess_action_outputs(actions: torch.Tensor) -> torch.Tensor:
         actions = actions.clone()
@@ -553,7 +581,7 @@ class VideoDriveAgent(AbstractAgent):
             num_frames=infer_inputs["num_frames"],
             frame_rate=infer_inputs["video_fps"],
             num_videos_per_prompt=sample_time,
-            output_type="pt",
+            output_type="final_latent",
             return_action=True,
             return_video=True,
             action_chunk=infer_inputs["action_chunk"],
@@ -570,11 +598,16 @@ class VideoDriveAgent(AbstractAgent):
         timing["pipe_infer"] = time.perf_counter() - t1
 
         preds = out.frames if hasattr(out, "frames") else out
+        if not isinstance(preds, dict) or "videos" not in preds:
+            raise TypeError("Joint pipeline must return action predictions and final video latents")
+        preds["videos"] = self._decode_joint_future_target_latents(preds["videos"])
         rollout = self._postprocess_joint_rollout_outputs(
             infer_inputs["cond_tensor"],
             preds,
             video_fps=infer_inputs["video_fps"],
-            condition_frames=infer_inputs["condition_frames"],
+            # The decoded target clip begins with only the current anchor frame;
+            # the preceding four history latents were memory, not decoded frames.
+            condition_frames=1,
             num_waypoints=infer_inputs["num_waypoints"],
             waypoint_interval_s=infer_inputs["waypoint_interval_s"],
             build_idm_clip=build_idm_clip,

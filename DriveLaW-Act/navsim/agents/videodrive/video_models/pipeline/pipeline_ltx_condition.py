@@ -1409,7 +1409,13 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             self.transformer_temporal_patch_size,
         )
 
-        if output_type == "latent":
+        if output_type == "final_latent":
+            # The joint NAVSIM model uses the first four latent frames as
+            # independently encoded memory.  Callers that need to decode only
+            # the temporally valid target latents must receive the final
+            # denoised sequence before this pipeline decodes it as a video.
+            video = latents
+        elif output_type == "latent":
             video = ctx_tokens
         else:
             latents = self._denormalize_latents(
