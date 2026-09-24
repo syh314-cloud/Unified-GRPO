@@ -46,7 +46,7 @@ from .idm_xvo_style import (
 # ----------------------------------------------------
 from torch.utils.tensorboard import SummaryWriter
 from .utils import init_logging, import_custom_class, save_video
-from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video, decode_latents
+from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
 from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 
@@ -478,7 +478,19 @@ class VideoDriveAgent(AbstractAgent):
 
         future_latents = final_latents[:, :, -2:].contiguous()
         vae_dtype = next(self.vae.parameters()).dtype
-        decoded = decode_latents(self.vae, future_latents, dtype=vae_dtype)
+        mean = self.vae.latents_mean.to(
+            device=future_latents.device, dtype=vae_dtype
+        ).view(1, -1, 1, 1, 1)
+        std = self.vae.latents_std.to(
+            device=future_latents.device, dtype=vae_dtype
+        ).view(1, -1, 1, 1, 1)
+        vae_latents = future_latents.to(dtype=vae_dtype) * std + mean
+        decode_timestep = torch.zeros(
+            vae_latents.shape[0], device=vae_latents.device, dtype=vae_latents.dtype
+        )
+        decoded = self.vae.decode(
+            vae_latents, decode_timestep, return_dict=False
+        )[0].clamp(-1, 1)
         decoded = self.pipe.video_processor.postprocess_video(decoded, output_type="pt")
         if decoded.ndim != 5 or decoded.shape[1] != 9:
             raise ValueError(
