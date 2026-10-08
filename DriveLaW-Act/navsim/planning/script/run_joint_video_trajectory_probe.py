@@ -66,6 +66,13 @@ def main(cfg: DictConfig) -> None:
     for directory in (video_dir, frame_dir, raw_decoded_frame_dir, trajectory_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
+    # The target clip is current plus eight future NAVSIM frames at 2 Hz.
+    # Keep the model's configured frame_rate intact, but export the probe at
+    # the target sampling rate so the MP4 preserves its four-second timeline.
+    output_fps = float(OmegaConf.select(cfg, "probe.output_fps", default=2.0))
+    if output_fps <= 0:
+        raise ValueError(f"probe.output_fps must be positive, got {output_fps}")
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -93,7 +100,8 @@ def main(cfg: DictConfig) -> None:
         "video_num_inference_steps": int(agent.args.video_num_inference_step),
         "action_num_inference_steps": int(agent.args.num_inference_step),
         "freeze_action_video_features": bool(agent.args.freeze_action_video_features),
-        "video_fps": int(agent.args.frame_rate),
+        "model_frame_rate": int(agent.args.frame_rate),
+        "export_fps": output_fps,
         "tokens": [],
         "samples": [],
     }
@@ -152,7 +160,7 @@ def main(cfg: DictConfig) -> None:
             _save_video(
                 decoded_video,
                 video_dir / f"{stem}_raw_decoded_all_frames.mp4",
-                fps=float(agent.args.frame_rate),
+                fps=output_fps,
             )
             torch.save(
                 {
