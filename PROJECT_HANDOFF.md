@@ -37,7 +37,7 @@ DriveLaW-Act 已恢复到论文代码的初始版本。当前与初始官方版�
 
        DriveLaW-Act/navsim/agents/videodrive/idm_xvo_style.py
 
-这三项 reward 的 GRPO 联合训练、尺度归一化及有效性验证尚未完成；当前保留的是 IDM 模块及相关工具代码。此前进行的视频生成训练只是为确认 DriveLaW 基线能否提供可用视频输入，与上述创新方法无关。
+这三项 reward 的 GRPO 联合训练、尺度归一化及有效性验证尚未完成；当前保留的是 IDM 模块及相关工具代码。此前进行的视频生成训练只是为确认 DriveLaW 基线能否提供可用视频输入，与上述创新方法无关。当前瓶颈：联合模型无法生成可用视频。
 
 ## 3. IDM 当前状态
 
@@ -75,7 +75,7 @@ checkpoint 数量：44。目录总大小约 169 GB。
 
 ### 4.2 2 Hz target RGB loss smoke test，1 step
 
-训练特点：验证新增 2 Hz target latent 与 RGB loss 路径是否可运行，不是可用模型。
+训练特点：验证新增的 RGB 监督训练路径是否可运行，不是可用模型。
 
     /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_smoke/
       2026_09_22_09_44_11/step_1/diffusion_pytorch_model.safetensors
@@ -98,7 +98,7 @@ checkpoint 数量：9。目录总大小约 36 GB。
 
 ### 4.4 2 Hz target RGB loss pilot 重跑，完成 44k steps
 
-训练特点：与 3.3 相同；4 张 H20、每卡 batch 1、实际 global batch 4，完成 44k steps、3 epochs。该实验视频输出仍为无结构块状图，未解决视频生成问题。
+训练特点：与 4.3 相同；4 张 H20、每卡 batch 1、实际 global batch 4，完成 44k steps、3 epochs。当前联合模型仍无法生成可用视频。
 
     /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/
       2026_09_27_12_59_57/
