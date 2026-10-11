@@ -1,295 +1,187 @@
-# DriveLaW 项目交接文档
-
-更新日期：2026-10-11  
-当前本地代码提交：`7b72958`  
-H20 运行仓库提交：`7b72958`
+# DriveLaW 项目交接现况
 
 ## 1. 原项目
 
-- 论文：**DriveLaW: Unifying Planning and Video Generation in a Latent Driving World**，CVPR 2026。
+- 论文：DriveLaW: Unifying Planning and Video Generation in a Latent Driving World，CVPR 2026。
 - arXiv：https://arxiv.org/abs/2512.23421
 - 官方代码：https://github.com/xiaomi-research/drivelaw
-- 权重：https://huggingface.co/tz2026/DriveLaW
+- 官方权重：https://huggingface.co/tz2026/DriveLaW
 
-DriveLaW 将视频世界模型和轨迹规划器放入同一个扩散 Transformer：Video DiT 生成未来视频 latent，Planning/Action DiT 读取 Video DiT latent 并生成 2 Hz、4 秒的 8 个轨迹点。
+原项目由两部分组成：
 
-代码目录：
+- DriveLaW-Video：生成未来驾驶视频的世界模型。
+- DriveLaW-Act：读取 Video DiT latent，生成 2 Hz、4 秒的 8 个轨迹点的扩散规划器。
 
-```text
-/home/sunyuhan/projects/Unified-GRPO
-  DriveLaW-Video/Infer/     # 官方视频模型推理
-  DriveLaW-Video/Train/     # 官方视频模型训练
-  DriveLaW-Act/             # NAVSIM 规划、联合模型和本项目改动
-```
+当前 H20 上运行的代码仓库为 Unified-GRPO，其中 DriveLaW-Act/ 是本项目的主要改动目录，DriveLaW-Video/ 保留官方视频训练和推理代码。
 
-H20 是嵌套 Docker，正确进入方式：
+## 2. 当前方法
 
-```bash
-# 外层 ltk-server
-docker exec -it 1226_privileged_ubuntu22.04 bash
-# 内层容器
-docker exec -it sunyuhan bash
-conda activate drivelaw_act
-cd /home/sunyuhan/projects/Unified-GRPO/DriveLaW-Act
-```
+当前尝试的总方法是在 DriveLaW 的联合 Video + Action 框架中，同时优化视频世界模型和轨迹规划分支。新增的总损失由三部分组成：
 
-不要在 H20 外层直接运行 `docker exec sunyuhan ...`。
+    L_total = L_video_flow + 0.1 * L_video_rgb + L_action
 
-## 2. 当前新增方法
+### 2.1 Video flow-matching loss
 
-### 2.1 联合 Video + Action Stage-3 训练
+Video 分支使用真实未来视频构造 latent target，并对 Video DiT 的 flow-matching 预测进行监督。
 
-目标：从发布的 **DriveLaW-Video** 权重开始，在 NAVSIM 上重新执行论文的 Stage-3 联合训练，同时加入真实未来视频监督。
+输入为 4 张历史前视图；历史图分别编码为 memory latent，只作为条件。以当前帧加 8 张 NAVSIM future 图构成 9 帧、2 Hz 的 target clip，经过 Temporal VAE 编码为 2 个 temporal target latent。
 
-当前视频 target 的定义：
+### 2.2 RGB reconstruction loss
 
-```text
-4 张历史前视图
-  -> 分别单帧 VAE encode
-  -> 4 个 memory latent，只作为条件
+将 Video DiT 预测出的两个 target latent 通过冻结的 Temporal VAE 解码为 9 帧，与当前帧加 8 张真实未来图计算 RGB L1 loss。其目的，是让 latent-space 的监督与可见视频质量直接关联。
 
-当前图 + 8 张 NAVSIM future 图（2 Hz，覆盖 4 秒）
-  -> 9 帧连续 target clip
-  -> Temporal VAE encode
-  -> 2 个 temporal target latent
+### 2.3 Action loss
 
-Video DiT 预测 2 个 target latent
-  -> flow-matching latent loss
-  -> VAE decode 为 9 帧
-  -> RGB L1 辅助 loss
-```
+Action / Planning DiT 保持论文 Stage-3 的扩散轨迹训练目标，学习生成 2 Hz、4 秒的 8 个轨迹点。该部分与视频 loss 联合训练。
 
-Action 分支保留论文 Stage-3 的 Action noise、target 和 conditioning 训练逻辑。
+## 3. 逆动力学模块（IDM）
 
-总损失：
+已实现 IDM，用视频帧预测轨迹，原计划用于比较：
 
-```text
-L = 1.0 * (L_video_flow + 0.1 * L_video_rgb) + 1.0 * L_action
-```
+    生成视频 -> IDM trajectory
+    World Model trajectory
+    GT trajectory
 
-RGB loss 是辅助项，不保证多步采样的视频质量。
+代码位置：
 
-### 2.2 逆动力学模块（IDM）
+    DriveLaW-Act/navsim/agents/videodrive/idm_xvo_style.py
+    DriveLaW-Act/navsim/agents/videodrive/run_training_idm_stage1.py
+    DriveLaW-Act/scripts/training/run_idm_stage1_training.sh
+    DriveLaW-Act/scripts/training/run_idm_stage1_sbatch.sh
+    DriveLaW-Act/navsim/planning/script/run_generated_video_idm_probe.py
 
-已实现由视频帧预测轨迹的 IDM，用于比较“生成视频 -> IDM 轨迹”和 World Model / GT 轨迹。
+IDM 已训练过，但尚未完成有效性验证。未完成真实视频上的 held-out 轨迹误差评估，也未完成生成视频上的可靠性验证，因此目前不能使用 IDM 输出或相关 PDM 分数证明方法有效。
 
-代码：
+北京超级云上旧的 IDM 训练输出路径：
 
-```text
-DriveLaW-Act/navsim/agents/videodrive/idm_xvo_style.py
-DriveLaW-Act/navsim/agents/videodrive/run_training_idm_stage1.py
-DriveLaW-Act/scripts/training/run_idm_stage1_training.sh
-DriveLaW-Act/scripts/training/run_idm_stage1_sbatch.sh
-DriveLaW-Act/navsim/planning/script/run_generated_video_idm_probe.py
-```
+    /data/home/scyb955/run/sunyuhan/projects/exp/idm_stage1_f0_speed/
 
-旧服务器上的一次 IDM 输出：
+其中包含 checkpoints/best.pt、train.log、metrics.jsonl 和 TensorBoard event。
 
-```text
-/data/home/scyb955/run/sunyuhan/projects/exp/idm_stage1_f0_speed/
-```
+## 4. 当前代码位置
 
-其中有 `checkpoints/best.pt`、`train.log`、`metrics.jsonl` 和 TensorBoard event；该目录不保证已迁移到 H20。
+### 4.1 联合训练
 
-IDM **尚未做严格有效性验证**。目前没有完成 held-out 轨迹误差、真实视频鲁棒性或生成视频上的系统比较，因此不能将 IDM 输出或相关 PDM 分数作为方法有效的结论。
+    DriveLaW-Act/navsim/agents/videodrive/run_training_joint_video_action.py
+      - 三个 loss 的计算
+      - history memory latent 和 future target latent 的构造
+      - 保留论文 Action 分支的训练逻辑
 
-## 3. 已完成部分
+    DriveLaW-Act/navsim/agents/videodrive/run_training_stage3_joint_video_action.py
+      - 联合训练入口
 
-### 3.1 H20 数据、权重和缓存
+    DriveLaW-Act/navsim/agents/videodrive/configs/ltx_model/video_model_stage3_joint_video_action.yaml
+      - loss 权重、优化器、DeepSpeed 和训练配置
 
-```text
-数据根目录：
-/rdata/sunyuhan/navsim_workspace/dataset
-  sensor_blobs/trainval
-  navsim_logs
-  maps
+    DriveLaW-Act/scripts/training/run_stage3_joint_video_action.sh
+      - 联合训练启动脚本
 
-VideoDrive cache：
-/rdata/sunyuhan/navsim_workspace/cache/videodrive_agent_cache_dir_final_front
+### 4.2 联合推理与可视化
 
-DriveLaW-Video 权重：
-/rdata/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video
-```
+    DriveLaW-Act/navsim/agents/videodrive/video_models/pipeline/pipeline_ltx_condition.py
+      - 返回最终 latent
 
-NAVTRAIN cache 已完成，历史日志显示 103258/103258 场景成功。
+    DriveLaW-Act/navsim/agents/videodrive/videodrive_agent.py
+      - 仅选取最后两个 temporal target latent 进行 VAE decode
 
-### 3.2 已完成的 Stage-3 pilot
+    DriveLaW-Act/navsim/planning/script/run_joint_video_trajectory_probe.py
+      - 保存生成视频、World trajectory 和 GT trajectory
 
-输出目录：
+    DriveLaW-Act/scripts/evaluation/run_latest_stage3_video_probe.sh
+      - 根据最新或指定 checkpoint 运行视频 probe
 
-```text
-/rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/
-  2026_09_27_12_59_57/step_44000/
-```
+### 4.3 兼容性修改
 
-配置：
+    DriveLaW-Act/navsim/agents/videodrive/run_training_videodrive.py
+      - DeepSpeed gradient accumulation 同步修复
 
-- 4 张 H20。
-- 每卡 batch 1，实际 global batch = 4。
-- 44,000 optimizer steps，3 epochs。
-- AdamW，learning rate `3e-5`，weight decay `1e-5`，bf16，DeepSpeed ZeRO-1。
-- Transformer 从发布的 **DriveLaW-Video** 初始化，不是发布的 DriveLaW-Act checkpoint。
-- Action expert 在模型构造时初始化；Action loss 保持论文 Stage-3 实现。
+## 5. 服务器数据、缓存和权重位置
 
-最终日志：
+### H20 当前服务器
 
-```text
-step 44000:
-total=0.11017
-video=0.10159
-flow=0.09382
-rgb=0.07769
-action=0.00858
-```
+    NAVSIM 数据：
+    /rdata/sunyuhan/navsim_workspace/dataset/
 
-这不是论文的严格规模复现。论文报告 global batch 192、44k steps，但未公开 GPU 数、每卡 batch 和梯度累积；本实验实际 global batch 为 4。
+    NAVSIM cache：
+    /rdata/sunyuhan/navsim_workspace/cache/videodrive_agent_cache_dir_final_front
 
-### 3.3 已生成的视频 probe
+    DriveLaW-Video 初始权重：
+    /rdata/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video/
 
-```text
-/rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/probes/step_44000_target2_decode/
+### 北京超级云旧服务器
 
-视频：
-videos/0000_0000be0b1dc65be3_raw_decoded_all_frames.mp4
+    代码：
+    /data/run01/scyb955/sunyuhan/projects/SD/DriveLaW-Act/
 
-逐帧 PNG：
-raw_decoded_frames/0000_0000be0b1dc65be3/frame_0000.png ... frame_0008.png
-```
+    NAVSIM 数据：
+    /data/home/scyb955/run/sunyuhan/navsim_workspace/dataset/
 
-当前 probe 只解码最后两个 temporal target latent，得到当前帧加 8 张未来帧，共 9 帧。视频以 2 FPS 导出，对应 `t=0, 0.5, ..., 4.0s`。旧的 41 帧拼接视频没有有效时间语义，不能作为结果。
+    IDM 训练输出：
+    /data/home/scyb955/run/sunyuhan/projects/exp/idm_stage1_f0_speed/
 
-## 4. 当前阻塞点
+## 6. 已完成训练与权重
 
-**step_44000 的 9 帧视频全部为无结构块状图，视频生成失败。**
+已完成一次联合 Video + Action 的 RGB-loss pilot：
 
-这不是 MP4 FPS 设置问题，也不是把 4 个 history latent 与 target latent 错误连续拼接为 41 帧造成的问题：当前推理只解码模型采样出的两个 target latent，结果仍然是噪声。
+    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/
+      2026_09_27_12_59_57/step_44000/
 
-因此当前 checkpoint 不能作为可用世界模型；在生成视频清晰且时序正确前，不能用它验证 IDM 或宣称视频-轨迹一致性。
+最终权重：
 
-loss 下降不代表多步视频采样正确。flow-matching loss 约束随机噪声级别的局部向量场；若训练时的 noise/sigma/timestep 定义和推理 scheduler 不一致，或条件 token layout 不一致，loss 可以下降而 30 步采样保持噪声。
+    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/2026_09_27_12_59_57/step_44000/diffusion_pytorch_model.safetensors
 
-不要直接继续另一轮 44k 训练，先定位训练-推理 contract。
+该训练使用 4 张 H20、每卡 batch 1，实际 global batch 为 4，共 44,000 steps、3 epochs。权重由发布的 DriveLaW-Video Transformer 初始化，不是由发布的 DriveLaW-Act checkpoint 初始化。
 
-## 5. 新增和修改的关键代码
+最终 loss：
 
-### 联合训练与视频 target
+    total=0.11017
+    video=0.10159
+    flow=0.09382
+    rgb=0.07769
+    action=0.00858
 
-```text
-DriveLaW-Act/navsim/agents/videodrive/run_training_joint_video_action.py
-  - 4 memory latent + 2 target latent 构造
-  - video flow-matching loss
-  - 9 帧 target clip 的 RGB L1 辅助 loss
-  - 论文 Stage-3 Action 分支
+对应的视频 probe 输出：
 
-DriveLaW-Act/navsim/agents/videodrive/run_training_stage3_joint_video_action.py
-  - Stage-3 训练入口
+    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/probes/step_44000_target2_decode/
 
-DriveLaW-Act/navsim/agents/videodrive/configs/ltx_model/video_model_stage3_joint_video_action.yaml
-  - 损失、优化器、DeepSpeed 和 Stage-3 配置
+    视频：
+    videos/0000_0000be0b1dc65be3_raw_decoded_all_frames.mp4
 
-DriveLaW-Act/scripts/training/run_stage3_joint_video_action.sh
-  - 训练启动脚本
+    逐帧 PNG：
+    raw_decoded_frames/0000_0000be0b1dc65be3/
 
-DriveLaW-Act/scripts/training/wait_and_run_stage3_joint_video_action.sh
-  - 等待 GPU 显存满足阈值后启动训练
-```
+## 7. 已尝试但失败的方法
 
-### 联合推理与视频导出
+### 7.1 直接解码 6 个 latent 为 41 帧
 
-```text
-DriveLaW-Act/navsim/agents/videodrive/video_models/pipeline/pipeline_ltx_condition.py
-  - 返回最终 latent，避免 pipeline 内直接 VAE decode
+早期将 4 个独立 history memory latent 和 2 个 future target latent 连续拼接，作为 6 个 temporal latent 直接送入 VAE decode，得到 41 帧视频。
 
-DriveLaW-Act/navsim/agents/videodrive/videodrive_agent.py
-  - 仅选最后 2 个 target latent 后 VAE decode
-  - 不再把 4 个独立 history memory latent 与 target latent 连续 decode
+该方法不成立：4 个 history latent 是分别单帧编码的 memory，不是连续 Temporal VAE 视频 latent；41 帧没有正确时间语义。该路径已废弃。
 
-DriveLaW-Act/navsim/planning/script/run_joint_video_trajectory_probe.py
-  - 保存单样本视频、World trajectory 和 GT trajectory
-  - probe 导出 FPS 为 2，模型内部 frame_rate=8 未改动
+### 7.2 仅使用 latent flow-matching loss 的联合训练
 
-DriveLaW-Act/scripts/evaluation/run_latest_stage3_video_probe.sh
-  - 自动寻找最新 checkpoint 并运行 probe
-```
+已完成一次 44k steps 联合训练，视频仍无法生成有效内容。仅看 flow loss 下降不能保证扩散采样视频正确。
 
-### 其他兼容性修改
+### 7.3 加入 RGB reconstruction loss 的联合训练
 
-```text
-DriveLaW-Act/navsim/agents/videodrive/run_training_videodrive.py
-  - DeepSpeed gradient accumulation 同步修复
-```
+在原 flow loss 和 Action loss 上加入两个 target latent 的 RGB L1 loss，完成了上述 44k steps pilot。
 
-## 6. 接手后的优先步骤
+结果仍失败：最新 checkpoint 生成的 9 帧视频全部为无结构、块状图像。说明当前问题不是视频导出 FPS，也不是 41 帧错误拼接造成的。
 
-按下面顺序做；不要先重训。
+### 7.4 修改导出 FPS
 
-1. **GT target VAE round-trip。**  
-   固定一个 token，用训练时相同方式构造 9 帧 target clip，VAE encode 成 2 个 latent 后立刻 decode。结果应清晰且与 GT 对齐。已有 oracle：
-   ```text
-   DriveLaW-Act/navsim/planning/script/run_vae_latent_oracle_probe.py
-   DriveLaW-Act/scripts/evaluation/run_vae_latent_oracle_probe_sbatch.sh
-   ```
+将 9 帧 target video 的导出 FPS 改为 2，以正确显示 t=0, 0.5, ..., 4.0s 的时间范围。该修改只修正播放速度，不改变图像内容，不能解决视频为噪声的问题。
 
-2. **单步 x0 诊断。**  
-   对同一 checkpoint 和训练 sigma，计算 `z0_hat = z_sigma - sigma * v_hat`，只 decode 最后两个 target latent。保存并比较：
-   - GT target latent decode
-   - 单步 x0 decode
-   - 30 步 pipeline decode
-   - latent MSE 与 RGB L1
+## 8. 当前瓶颈
 
-   判定：
-   - 单步 x0 清晰、30 步采样为噪声：问题在 scheduler / sigma / timestep 推理 contract。
-   - 单步 x0 也是噪声：问题在训练 target、条件布局、初始化或优化规模。
+当前核心瓶颈是：Video DiT 在联合训练后仍无法从条件 latent 生成可用的 future target latent，VAE decode 后得到全程块状噪声视频。
 
-3. **逐项核对训练和推理条件布局。**  
-   核查 history memory latent、mask、token 排序、`latent_frames=6`、`pixel_wise_timestep` 和 scheduler timestep。重点文件：
-   ```text
-   run_training_joint_video_action.py
-   pipeline_ltx_condition.py
-   videodrive_agent.py
-   ```
+当前结果不能说明视频世界模型具备生成能力，也不能开展基于生成视频的 IDM 验证。
 
-4. **定位完成后才重训。**  
-   先跑短诊断训练并保存固定样本可视化。若要对齐论文 global batch 192，需解决资源与梯度累积；现有 batch 4 pilot 不能视为论文复现。
+虽然训练 loss 下降，但多步采样结果失败。最可能的问题类别包括：
 
-5. **最后验证 IDM。**  
-   先在真实视频上评估 IDM，再在生成视频上评估，报告轨迹误差和 PDM 指标，不能仅展示个例。
-
-## 7. 常用命令
-
-查看 checkpoint 和 probe：
-
-```bash
-TRAIN=/rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun
-find "$TRAIN" -path '*/step_*/diffusion_pytorch_model.safetensors' -print
-find "$TRAIN/probes/step_44000_target2_decode" -type f | sort
-```
-
-重跑指定 checkpoint 的单样本 probe：
-
-```bash
-export REPO=/home/sunyuhan/projects/Unified-GRPO/DriveLaW-Act
-export OPENSCENE_DATA_ROOT=/rdata/sunyuhan/navsim_workspace/dataset
-export DRIVELAW_VIDEO_ROOT=/rdata/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video
-export TRAIN_OUTPUT_ROOT=/rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun
-export CHECKPOINT_PATH="$TRAIN_OUTPUT_ROOT/2026_09_27_12_59_57/step_44000/diffusion_pytorch_model.safetensors"
-export PROBE_OUTPUT_DIR="$TRAIN_OUTPUT_ROOT/probes/manual_step_44000"
-export PROBE_LIMIT=1
-export TRAIN_TEST_SPLIT=navtrain
-bash "$REPO/scripts/evaluation/run_latest_stage3_video_probe.sh"
-```
-
-## 8. Git 注意事项
-
-本地提交 `7b72958` 已通过 Git bundle 同步到 H20 运行仓库。GitHub SSH/网络认证尚未恢复，`origin/main` 仍停在 `4384ac5`；不要假设 `git pull` 能拿到后续提交。
-
-接手前检查：
-
-```bash
-cd /home/sunyuhan/projects/Unified-GRPO
-git log --oneline -5
-git status --short
-```
-
-恢复 GitHub SSH 认证后，再将 `7b72958` 及后续提交推送到远端。
+- 训练阶段和推理阶段的 scheduler、sigma 或 timestep 定义不一致。
+- 训练和推理的 memory latent、mask、token 排序或 latent frame layout 不一致。
+- 当前 4 GPU、global batch 4 的 pilot 与论文 global batch 192 的优化规模差异较大。
+- RGB loss 权重为 0.1，无法单独约束最终多步采样质量。
 
