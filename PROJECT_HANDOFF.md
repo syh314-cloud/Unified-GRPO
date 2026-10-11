@@ -55,75 +55,7 @@ IDM 已训练过，但没有完成严格的有效性验证。尚未完成真实�
 
 其中包含 checkpoints/best.pt、train.log、metrics.jsonl 和 TensorBoard event。该 IDM checkpoint 不在 H20 的当前训练输出目录中。
 
-## 4. H20 上已训练的权重
-
-以下均为本项目训练产生的 Transformer checkpoint，单个 safetensors 文件约 4.1 GB。
-
-### 4.1 首次 Stage-3 联合 Video + Action 训练，完成 44k steps
-
-训练特点：联合 Video + Action；未加入后续的 2 Hz target RGB loss。
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_run2/
-      2026_09_15_18_46_29/
-      step_1000/ ... step_44000/
-
-最终权重：
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_run2/2026_09_15_18_46_29/step_44000/diffusion_pytorch_model.safetensors
-
-checkpoint 数量：44。目录总大小约 169 GB。
-
-### 4.2 2 Hz target RGB loss smoke test，1 step
-
-训练特点：验证新增的 RGB 监督训练路径是否可运行，不是可用模型。
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_smoke/
-      2026_09_22_09_44_11/step_1/diffusion_pytorch_model.safetensors
-
-checkpoint 数量：1。目录总大小约 3.9 GB。
-
-### 4.3 2 Hz target RGB loss pilot，训练中断于 9k steps
-
-训练特点：4 张 H20、每卡 batch 1、实际 global batch 4；加入 video flow loss、RGB loss 和 Action loss。该 run 因 NCCL 问题中断。
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_44k/
-      2026_09_22_10_03_45/
-      step_1000/ ... step_9000/
-
-最新权重：
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_44k/2026_09_22_10_03_45/step_9000/diffusion_pytorch_model.safetensors
-
-checkpoint 数量：9。目录总大小约 36 GB。
-
-### 4.4 2 Hz target RGB loss pilot 重跑，完成 44k steps
-
-训练特点：与 4.3 相同；4 张 H20、每卡 batch 1、实际 global batch 4，完成 44k steps、3 epochs。当前联合模型仍无法生成可用视频。
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/
-      2026_09_27_12_59_57/
-      step_1000/ ... step_44000/
-
-最终权重：
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_pilot_b4_rerun/2026_09_27_12_59_57/step_44000/diffusion_pytorch_model.safetensors
-
-checkpoint 数量：44。目录总大小约 169 GB。
-
-### 4.5 无 checkpoint 的失败启动目录
-
-以下目录存在，但没有生成任何模型 checkpoint：
-
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_run1/
-    /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_run2/
-
-### 4.6 官方下载的初始权重，不是本项目训练产物
-
-    /rdata/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video/
-
-该目录是训练时使用的公开 DriveLaW-Video 初始化权重。
-
-## 5. 服务器数据和代码位置
+## 4. 服务器数据和代码位置
 
 ### H20
 
