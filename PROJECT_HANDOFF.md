@@ -21,7 +21,25 @@ DriveLaW-Act 已恢复到论文代码的初始版本。当前与初始官方版�
 - 官方代码：https://github.com/xiaomi-research/drivelaw
 - 官方权重：https://huggingface.co/tz2026/DriveLaW
 
-## 2. IDM 当前状态
+## 2. 新方法：三项强化学习奖励
+
+本项目的创新方法是基于 GRPO 的强化学习优化，不是视频生成训练。对同一驾驶场景采样多条候选轨迹及其对应未来视频，并以三项奖励信号构造优化目标：
+
+1. PDM 驾驶奖励：使用 NAVSIM 的 PDM scorer 对候选轨迹进行闭环安全、进度、舒适性和驾驶方向等评估。现有基础实现位于：
+
+       DriveLaW-Act/navsim/agents/videodrive/video_models/planner/diffusion_planner.py
+
+2. IDM 轨迹一致性奖励：将生成视频输入逆动力学模块得到轨迹，与采样的 Action trajectory 比较位置和航向误差，奖励为该加权误差的相反数。实现位于：
+
+       DriveLaW-Act/navsim/agents/videodrive/idm_xvo_style.py
+
+3. MUSIQ 视频质量奖励：对生成未来视频的中间帧和末帧计算 MUSIQ 分数并取平均，用于约束生成结果的感知质量。实现位于：
+
+       DriveLaW-Act/navsim/agents/videodrive/idm_xvo_style.py
+
+这三项 reward 的 GRPO 联合训练、尺度归一化及有效性验证尚未完成；当前保留的是 IDM 模块及相关工具代码。此前进行的视频生成训练只是为确认 DriveLaW 基线能否提供可用视频输入，与上述创新方法无关。
+
+## 3. IDM 当前状态
 
 IDM 的目标是从视频帧预测 2 Hz、4 秒的 8 点轨迹，用于比较：
 
@@ -37,11 +55,11 @@ IDM 已训练过，但没有完成严格的有效性验证。尚未完成真实�
 
 其中包含 checkpoints/best.pt、train.log、metrics.jsonl 和 TensorBoard event。该 IDM checkpoint 不在 H20 的当前训练输出目录中。
 
-## 3. H20 上已训练的权重
+## 4. H20 上已训练的权重
 
 以下均为本项目训练产生的 Transformer checkpoint，单个 safetensors 文件约 4.1 GB。
 
-### 3.1 首次 Stage-3 联合 Video + Action 训练，完成 44k steps
+### 4.1 首次 Stage-3 联合 Video + Action 训练，完成 44k steps
 
 训练特点：联合 Video + Action；未加入后续的 2 Hz target RGB loss。
 
@@ -55,7 +73,7 @@ IDM 已训练过，但没有完成严格的有效性验证。尚未完成真实�
 
 checkpoint 数量：44。目录总大小约 169 GB。
 
-### 3.2 2 Hz target RGB loss smoke test，1 step
+### 4.2 2 Hz target RGB loss smoke test，1 step
 
 训练特点：验证新增 2 Hz target latent 与 RGB loss 路径是否可运行，不是可用模型。
 
@@ -64,7 +82,7 @@ checkpoint 数量：44。目录总大小约 169 GB。
 
 checkpoint 数量：1。目录总大小约 3.9 GB。
 
-### 3.3 2 Hz target RGB loss pilot，训练中断于 9k steps
+### 4.3 2 Hz target RGB loss pilot，训练中断于 9k steps
 
 训练特点：4 张 H20、每卡 batch 1、实际 global batch 4；加入 video flow loss、RGB loss 和 Action loss。该 run 因 NCCL 问题中断。
 
@@ -78,7 +96,7 @@ checkpoint 数量：1。目录总大小约 3.9 GB。
 
 checkpoint 数量：9。目录总大小约 36 GB。
 
-### 3.4 2 Hz target RGB loss pilot 重跑，完成 44k steps
+### 4.4 2 Hz target RGB loss pilot 重跑，完成 44k steps
 
 训练特点：与 3.3 相同；4 张 H20、每卡 batch 1、实际 global batch 4，完成 44k steps、3 epochs。该实验视频输出仍为无结构块状图，未解决视频生成问题。
 
@@ -92,20 +110,20 @@ checkpoint 数量：9。目录总大小约 36 GB。
 
 checkpoint 数量：44。目录总大小约 169 GB。
 
-### 3.5 无 checkpoint 的失败启动目录
+### 4.5 无 checkpoint 的失败启动目录
 
 以下目录存在，但没有生成任何模型 checkpoint：
 
     /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_run1/
     /rdata/sunyuhan/projects/exp/stage3_joint_video_action_4gpu_2hz_rgb_run2/
 
-### 3.6 官方下载的初始权重，不是本项目训练产物
+### 4.6 官方下载的初始权重，不是本项目训练产物
 
     /rdata/sunyuhan/projects/models/DriveLaW_weights/DriveLaW-Video/
 
 该目录是训练时使用的公开 DriveLaW-Video 初始化权重。
 
-## 4. 服务器数据和代码位置
+## 5. 服务器数据和代码位置
 
 ### H20
 
@@ -129,4 +147,3 @@ checkpoint 数量：44。目录总大小约 169 GB。
 
     IDM 训练输出：
     /data/home/scyb955/run/sunyuhan/projects/exp/idm_stage1_f0_speed/
-
