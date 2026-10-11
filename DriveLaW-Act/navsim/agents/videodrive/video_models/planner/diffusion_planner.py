@@ -84,9 +84,6 @@ class GRPOConfig:
     clip_advantage_lower_quantile: float = 0.0
     clip_advantage_upper_quantile: float = 1.0
     gamma_denoising: float = 0.6
-    lambda_pdms: float = 1.0
-    lambda_idm: float = 1.0
-    lambda_musiq: float = 0.0
     
     metric_cache_path: str = "/path/to/metric_cache_train"
     reference_policy_checkpoint: str = "/path/to/IL_Model.ckpt"
@@ -273,9 +270,6 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         self.clip_advantage_lower_quantile = cfg.clip_advantage_lower_quantile
         self.clip_advantage_upper_quantile = cfg.clip_advantage_upper_quantile
         self.gamma_denoising = cfg.gamma_denoising
-        self.lambda_pdms = cfg.lambda_pdms
-        self.lambda_idm = cfg.lambda_idm
-        self.lambda_musiq = cfg.lambda_musiq
         
         self.metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
         proposal_sampling = TrajectorySampling(time_horizon=4, interval_length=0.1)
@@ -830,9 +824,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         sample_time: int = 8,
         deterministic=False,
         bc_coeff: float = 0.1,
-        use_bc_loss: bool = True,
-        idm_rewards: Optional[torch.Tensor] = None,
-        musiq_rewards: Optional[torch.Tensor] = None,
+        use_bc_loss: bool = True
     ) -> BatchFeature:
         """Computes the Diffusion-GRPO loss."""
         self.set_frozen_modules_to_eval_mode()
@@ -854,14 +846,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             path = self.metric_cache_loader.metric_cache_paths[token]
             with lzma.open(path, 'rb') as f:
                 metric_cache[token] = pickle.load(f)
-        rewards_dict = self.reward_fn(
-            trajs,
-            tokens_rep,
-            metric_cache,
-            idm_rewards=idm_rewards,
-            musiq_rewards=musiq_rewards,
-        )
-        rewards = rewards_dict["reward"]
+        rewards = self.reward_fn(trajs, tokens_rep, metric_cache)
 
         rewards_matrix = rewards.view(B, G)
         mean_r = rewards_matrix.mean(dim=1, keepdim=True)
@@ -900,17 +885,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             bc_loss = -bc_logp.mean()
             total_loss = total_loss + bc_coeff * bc_loss
 
-        return BatchFeature(
-            data={
-                "loss": total_loss,
-                "reward": rewards.mean(),
-                "policy_loss": policy_loss,
-                "bc_loss": bc_loss,
-                "pdms_reward": rewards_dict["pdms_reward"].mean(),
-                "idm_reward": rewards_dict["idm_reward"].mean(),
-                "musiq_reward": rewards_dict["musiq_reward"].mean(),
-            }
-        )
+        return BatchFeature(data={"loss": total_loss, "reward": rewards.mean(), "policy_loss": policy_loss, "bc_loss": bc_loss})
 
     def norm_odo(self, trajectory: torch.Tensor) -> torch.Tensor:
         """Normalizes trajectory coordinates and heading to the range [-1, 1]."""
@@ -931,12 +906,10 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         pred_traj: torch.Tensor,
         tokens_list,
         cache_dict,
-        idm_rewards: Optional[torch.Tensor] = None,
-        musiq_rewards: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Calculates the combined GRPO rewards for a batch of predicted trajectories."""
+    ) -> torch.Tensor:
+        """Calculates PDM scores for a batch of predicted trajectories."""
         pred_np = pred_traj.detach().cpu().numpy()
-        pdms_rewards = []
+        rewards = []
         for i, token in enumerate(tokens_list):
             trajectory = Trajectory(pred_np[i])
             metric_cache = cache_dict[token]
@@ -947,48 +920,8 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 simulator=self.simulator,
                 scorer=self.train_scorer,
             )
-            pdms_rewards.append(asdict(pdm_result)["score"])
-
-        pdms_rewards = torch.tensor(
-            pdms_rewards,
-            device=pred_traj.device,
-            dtype=pred_traj.dtype,
-        ).detach()
-
-        if idm_rewards is None:
-            idm_rewards = torch.zeros_like(pdms_rewards)
-        else:
-            if idm_rewards.shape != pdms_rewards.shape:
-                raise ValueError(
-                    "idm_rewards must match predicted trajectory batch shape, "
-                    f"got {tuple(idm_rewards.shape)} vs {tuple(pdms_rewards.shape)}"
-            )
-            idm_rewards = idm_rewards.to(device=pred_traj.device, dtype=pred_traj.dtype).detach()
-
-        if musiq_rewards is None:
-            musiq_rewards = torch.zeros_like(pdms_rewards)
-        else:
-            if musiq_rewards.shape != pdms_rewards.shape:
-                raise ValueError(
-                    "musiq_rewards must match predicted trajectory batch shape, "
-                    f"got {tuple(musiq_rewards.shape)} vs {tuple(pdms_rewards.shape)}"
-                )
-            musiq_rewards = musiq_rewards.to(
-                device=pred_traj.device,
-                dtype=pred_traj.dtype,
-            ).detach()
-
-        total_rewards = (
-            self.lambda_pdms * pdms_rewards
-            + self.lambda_idm * idm_rewards
-            + self.lambda_musiq * musiq_rewards
-        )
-        return {
-            "reward": total_rewards,
-            "pdms_reward": pdms_rewards,
-            "idm_reward": idm_rewards,
-            "musiq_reward": musiq_rewards,
-        }
+            rewards.append(asdict(pdm_result)["score"])
+        return torch.tensor(rewards, device=pred_traj.device, dtype=pred_traj.dtype).detach()
 
     @property
     def device(self):

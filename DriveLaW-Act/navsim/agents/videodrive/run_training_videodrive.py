@@ -75,7 +75,7 @@ from utils.data_utils import (
 from utils.timestep_samplers import SAMPLERS
 
 from utils.extra_utils import act_metric
-from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
+from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 
 # ---------------- NavSim deps ----------------
 from navsim.agents.abstract_agent import AbstractAgent
@@ -84,8 +84,7 @@ from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 
 # ---------------- Config constants ----------------
-# Hydra resolves this path relative to this module, not the process cwd.
-CONFIG_PATH = "../../planning/script/config/training"
+CONFIG_PATH = "path/to/DriveLaW-Act/navsim/planning/script/config/training"
 CONFIG_NAME = "default_training"
 
 logger = get_logger("unified_trainer")
@@ -96,7 +95,7 @@ logger.setLevel(LOG_LEVEL)
 # ===========================
 # Prompt builder
 # ===========================
-NAV_CMDS = ["turn left", "go straight", "turn right", "unknown"]
+NAV_CMDS = ['turn left', 'go straight', 'turn right']
 
 def _round_up_to(x: int, m: int) -> int:
     return (x + m - 1) // m * m
@@ -146,11 +145,7 @@ def one_hot_to_cmd(one_hot) -> str:
         one_hot = one_hot.tolist()
     else:
         one_hot = list(one_hot)
-    active_indices = [i for i, value in enumerate(one_hot) if float(value) > 0.5]
-    if len(active_indices) != 1:
-        return "unknown"
-    index = active_indices[0]
-    return NAV_CMDS[index] if index < len(NAV_CMDS) else "unknown"
+    return next((NAV_CMDS[i] for i, v in enumerate(one_hot) if v == 1), "unknown")
 
 def build_prompt_fixed(hist_xyh: torch.Tensor,
                        high_cmd_one_hot,
@@ -521,10 +516,6 @@ class UnifiedTrainer:
             grad_accum = self.cfg.gradient_accumulation_steps
             train_batch_size = per_device_bs * world_size * grad_accum
             self.args.deepspeed["train_batch_size"] = train_batch_size
-            # DeepSpeed otherwise defaults to one accumulation step even when
-            # Accelerator is configured differently. Keep both engines on the
-            # same effective global batch.
-            self.args.deepspeed["gradient_accumulation_steps"] = grad_accum
             ds_plugin = DeepSpeedPlugin(hf_ds_config=self.args.deepspeed,
                                         gradient_accumulation_steps=grad_accum)
 
@@ -695,8 +686,8 @@ class UnifiedTrainer:
         if self.args.mixed_precision == "fp16":
             cast_training_params([self.diffusion_model], dtype=torch.float32)
 
-        if self.args.gradient_checkpointing:
-            self.diffusion_model.enable_gradient_checkpointing()
+        # if self.args.gradient_checkpointing:
+        #     self.diffusion_model.enable_gradient_checkpointing()
 
         if self.args.allow_tf32 and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -708,13 +699,6 @@ class UnifiedTrainer:
                 p.requires_grad = ('action_' in name)
             elif train_mode == "video_only":
                 p.requires_grad = ('action_' not in name)
-            elif train_mode == "video_action_adapt":
-                is_action_parameter = (
-                    'action_' in name
-                    or name == 'plan_anchor'
-                    or name.startswith('traj_scorer.')
-                )
-                p.requires_grad = not is_action_parameter
             elif train_mode in ("all", "action_full"):
                 p.requires_grad = True
             else:
@@ -751,7 +735,7 @@ class UnifiedTrainer:
                     f.write(_format_param(n, p) + "\n")
             logger.info(f"Wrote detailed parameter list to {out_txt}")
 
-        self.state.learning_rate = float(self.args.lr)
+        self.state.learning_rate = 3e-5
         # if self.cfg.scale_lr:
         #     self.state.learning_rate = (
         #         self.state.learning_rate
@@ -764,12 +748,12 @@ class UnifiedTrainer:
         self.optimizer = get_optimizer(
             params_to_optimize=params_to_optimize,
             optimizer_name=self.args.optimizer,
-            learning_rate=self.state.learning_rate,
-            beta1=float(self.args.beta1),
-            beta2=float(self.args.beta2),
-            beta3=float(self.args.beta3),
-            epsilon=float(self.args.epsilon),
-            weight_decay=float(self.args.weight_decay),
+            learning_rate=3e-5,
+            beta1=0.9,
+            beta2=0.95,
+            beta3=0.999,
+            epsilon=1e-8,
+            weight_decay=1e-5,
             use_8bit=getattr(self.args, "optimizer_8bit", False),
             use_torchao=getattr(self.args, "optimizer_torchao", False),
         )
@@ -828,10 +812,7 @@ class UnifiedTrainer:
             self.state.accelerator.prepare(self.diffusion_model, self.optimizer, self.train_dataloader, self.val_dataloader, self.lr_scheduler)
 
     def prepare_trackers(self):
-        # Passing config makes older TensorBoard versions call add_hparams(),
-        # which is incompatible with NumPy >= 2.0 (np.string_ was removed).
-        # Scalar logging remains fully enabled without the hparams payload.
-        self.state.accelerator.init_trackers("navsim_train")
+        self.state.accelerator.init_trackers("navsim_train", config=self.args.__dict__)
 
     def _create_first_frame_conditioning_mask(
         self, batch_size: int, sequence_length: int, height: int, width: int, device: torch.device

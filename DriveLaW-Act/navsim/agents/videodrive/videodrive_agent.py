@@ -38,16 +38,11 @@ from einops import rearrange
 
 from .utils.model_utils import load_condition_models, load_latent_models, load_vae_models, load_diffusion_model, count_model_parameters, unwrap_model
 from .utils.model_loader import load_vae
-from .idm_xvo_style import (
-    build_drivelaw_idm_clip,
-    compute_idm_consistency_reward,
-    compute_musiq_reward,
-)
 # ----------------------------------------------------
 from torch.utils.tensorboard import SummaryWriter
 from .utils import init_logging, import_custom_class, save_video
 from .utils.data_utils import get_latents, get_text_conditions, gen_noise_from_condition_frame_latent, randn_tensor, apply_color_jitter_to_video
-from .video_models.pipeline.pipeline_ltx_condition import LTXVideoCondition
+from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 
 import os
@@ -95,7 +90,6 @@ class VideoDriveAgent(AbstractAgent):
         self.scheduler = None
 
         self.pipe = None
-        self.musiq_metric = None
 
         self.weight_dtype = torch.bfloat16
         self.device = "cuda" # device
@@ -109,18 +103,6 @@ class VideoDriveAgent(AbstractAgent):
 
     def name(self) -> str:
         return self.__class__.__name__
-
-    def _get_musiq_metric(self) -> torch.nn.Module:
-        if self.musiq_metric is None:
-            try:
-                import pyiqa
-            except ImportError as exc:
-                raise ImportError(
-                    "PyIQA is required for Reward 3. Install it with `pip install pyiqa`."
-                ) from exc
-            self.musiq_metric = pyiqa.create_metric("musiq").to(self.device)
-            self.musiq_metric.eval()
-        return self.musiq_metric
 
     def initialize(self) -> None:
         print("Initializing models")
@@ -268,86 +250,85 @@ class VideoDriveAgent(AbstractAgent):
             x_5d = torch.cat([x_5d, tail], dim=2)
         return x_5d
 
-    @staticmethod
-    def _slice_feature_sample(features: Dict[str, torch.Tensor], index: int) -> Dict[str, torch.Tensor]:
-        sample = {}
-        for key, value in features.items():
-            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] > index:
-                sample[key] = value[index:index + 1]
-            else:
-                sample[key] = value
-        return sample
-
-    def _prepare_joint_infer_inputs(self, features: Dict[str, torch.Tensor]):
+    @torch.inference_mode()
+    def forward_test(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = self.device
         args = self.args
+        
         timing = {}
 
         if "images" not in features:
             raise ValueError("forward_test expects features['images'] = (T,C,H,W) conditioning frames.")
-        cond_tensor = features["images"]
-
+        cond_tensor = features["images"]  # (T,3,H,W)
+        
         if cond_tensor.ndim == 5:
-            if cond_tensor.shape[0] != 1:
-                raise ValueError(
-                    "sample_joint_rollouts expects a single sample; "
-                    "use `sample_joint_rollouts_batched` for batched features."
-                )
             cond_tensor = cond_tensor.squeeze(0)
         elif cond_tensor.ndim == 3:
             cond_tensor = cond_tensor.unsqueeze(0)
         elif cond_tensor.ndim != 4:
             raise ValueError(f"Expected cond_tensor (T,C,H,W), got shape {cond_tensor.shape}")
-
-        t_cond, _, _, _ = cond_tensor.shape
-        assert t_cond == 4
+        
+        T_cond, _, H_in, W_in = cond_tensor.shape
+        assert T_cond == 4
         weight_dtype = torch.bfloat16
 
+        # hist = features["history_trajectory"].to(torch.float32).squeeze(0)
+        # x0, y0, th0 = hist[0]         
+        # xT, yT, thT = hist[-1]        
+
+        # def _delta(a_last, a_first):
+        #     return float((a_last - a_first).item())
+
+        # dx_total = _delta(xT, x0)      
+        # dy_total = _delta(yT, y0)    
+        # dyaw_total = _delta(thT, th0) 
+
+        # total_forward = abs(float(x0.item()))    
+        # total_lateral = abs(float(y0.item()))
+        # net_yaw_change = abs(float(th0.item()))
+
+        # vel = features["vel"].squeeze(0)  # (2,)
+        # acc = features["acc"].squeeze(0)  # (2,)
+        # speed_mps = float(torch.linalg.norm(vel).item()) 
+        # acc_abs   = float(torch.linalg.norm(acc).item()) 
+
         context_dict = {
-            "cmd_onehot": features["driving_command"].to(device, dtype=weight_dtype),
-            "vel": features["vel"].to(device, dtype=weight_dtype),
-            "acc": features["acc"].to(device, dtype=weight_dtype),
-        }
+                    "cmd_onehot": features["driving_command"].to(device, dtype=weight_dtype),
+                    "vel":        features["vel"].to(device, dtype=weight_dtype),
+                    "acc":        features["acc"].to(device, dtype=weight_dtype),
+                }
 
         prompt = (
-            "A high-quality, photorealistic dashboard camera view of autonomous driving. "
-            "Based on the past 2 seconds videos, "
-            "predict and generate the next 4 seconds of realistic driving continuation, "
-            "Maintain temporal consistency, stable camera perspective, natural motion flow without jitter or artifacts, "
-            "clear details, and realistic physics. "
+            f"A high-quality, photorealistic dashboard camera view of autonomous driving. "
+            f"Based on the past 2 seconds videos, "
+            f"predict and generate the next 4 seconds of realistic driving continuation, "
+            f"Maintain temporal consistency, stable camera perspective, natural motion flow without jitter or artifacts, "
+            f"clear details, and realistic physics. "
         )
+        
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         cond_pils: List[Image.Image] = self._tensor_video_to_pils(cond_tensor)
         torch.cuda.synchronize()
-        timing["image_preprocessing"] = time.perf_counter() - t0
+        timing['image_preprocessing'] = time.perf_counter() - t0
+        
 
-        # Generate at the model's native temporal rate, then explicitly
-        # resample to the IDM waypoint timestamps below.
-        video_fps = int(getattr(args, "frame_rate", 8))
-        condition_frames = int(getattr(args, "condition_frames", t_cond))
-        num_waypoints = int(getattr(args, "num_waypoints", 8))
-        waypoint_interval_s = float(self._trajectory_sampling.interval_length)
-        required_future_frames = int(math.ceil(num_waypoints * waypoint_interval_s * video_fps))
-        num_frames = int(
-            getattr(args, "num_frames", condition_frames + required_future_frames + 1)
-        )
-        action_num_steps = int(getattr(args, "num_inference_step", 5))
-        video_num_steps = int(
-            getattr(args, "video_num_inference_step", action_num_steps)
-        )
-        seed = int(getattr(args, "seed", 42))
-        negative_prompt = getattr(
-            args,
-            "negative_prompt",
+        # height = int(getattr(args, "height", H_in))
+        # width  = int(getattr(args, "width",  W_in))
+        # height, width = self.round_to_vae_resolution(height, width)
+
+        num_frames = int(getattr(args, "num_frames", T_cond))
+        num_steps  = int(getattr(args, "num_inference_step", 20))
+        seed       = int(getattr(args, "seed", 42))
+        negative_prompt = getattr(args, "negative_prompt",
             "worst quality, low quality, blurry, jittery, distorted, motion blur, ghosting, "
             "flickering, stuttering, camera shake, unstable footage, warping, trailing artifacts, "
-            "temporal inconsistency, jerky motion, choppy framerate",
+            "temporal inconsistency, jerky motion, choppy framerate"
         )
-
-        action_chunk = int(getattr(args, "action_chunk", 8))
-        action_dim = int(getattr(args, "action_dim", 3))
+        
+        action_chunk = int(getattr(args, "action_chunk",8))  
+        action_dim   = int(getattr(args, "action_dim", 3))                         
 
         if self.view_mode == "surround6":
             height, width = 256, 3072
@@ -359,447 +340,55 @@ class VideoDriveAgent(AbstractAgent):
                 width = int(args.width)
 
         condition = LTXVideoCondition(video=cond_pils, frame_index=0)
-        return {
-            "cond_tensor": cond_tensor,
-            "context_dict": context_dict,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "num_frames": num_frames,
-            "video_fps": video_fps,
-            "condition_frames": condition_frames,
-            "num_waypoints": num_waypoints,
-            "waypoint_interval_s": waypoint_interval_s,
-            "action_num_steps": action_num_steps,
-            "video_num_steps": video_num_steps,
-            "seed": seed,
-            "action_chunk": action_chunk,
-            "action_dim": action_dim,
-            "height": height,
-            "width": width,
-            "condition": condition,
-            "timing": timing,
-        }
+        generator = torch.Generator(device=device).manual_seed(seed)
 
-    def _postprocess_joint_rollout_outputs(
-        self,
-        cond_tensor: torch.Tensor,
-        preds: Dict[str, torch.Tensor],
-        video_fps: int,
-        condition_frames: int,
-        num_waypoints: int,
-        waypoint_interval_s: float,
-        build_idm_clip: bool,
-        extract_future_video: bool = True,
-    ) -> Dict[str, object]:
-        actions = self._postprocess_action_outputs(preds["actions"])
-        generated_video = preds["videos"]
-
-        if not torch.is_tensor(generated_video):
-            raise TypeError(f"Expected generated video to be a tensor, got {type(generated_video)}")
-        generated_video = generated_video.detach().float().cpu()  # (G, F, C, H, W)
-        if generated_video.ndim != 5:
-            raise ValueError(f"Expected generated video shape (B,F,C,H,W), got {tuple(generated_video.shape)}")
-
-        rollout: Dict[str, object] = {
-            "actions_tensor": actions,
-            "actions": actions.numpy(),
-            "decoded_video": generated_video,
-        }
-        if not extract_future_video:
-            if build_idm_clip:
-                raise ValueError("build_idm_clip requires extract_future_video=True")
-            return rollout
-
-        if video_fps <= 0:
-            raise ValueError(f"video_fps must be positive, got {video_fps}")
-        temporal_ratio = int(self.pipe.vae_temporal_compression_ratio)
-        condition_pixel_frames = (condition_frames - 1) * temporal_ratio + 1
-        if generated_video.shape[1] <= condition_pixel_frames:
-            raise ValueError(
-                f"Decoded video has {generated_video.shape[1]} frames, but the "
-                f"{condition_frames} conditioning latents occupy the first "
-                f"{condition_pixel_frames} decoded frames."
-            )
-        future_video = generated_video[:, condition_pixel_frames:].contiguous()
-
-        rollout.update({
-            "generated_video": future_video,
-            "condition_pixel_frames": condition_pixel_frames,
-        })
-        if not build_idm_clip:
-            return rollout
-
-        target_times = torch.arange(1, num_waypoints + 1, dtype=torch.float32) * waypoint_interval_s
-        # Frame 0 is the first future sample, so t seconds maps to ceil(t*fps)-1.
-        target_indices = torch.ceil(target_times * video_fps).long() - 1
-        max_index = int(target_indices.max().item())
-        if future_video.shape[1] <= max_index:
-            raise ValueError(
-                "Generated video is too short for IDM temporal alignment: "
-                f"need {max_index + 1} future frames at {video_fps} FPS for "
-                f"{num_waypoints} waypoints every {waypoint_interval_s:.3f}s, "
-                f"but got {future_video.shape[1]}. Increase the number of future latents."
-            )
-        generated_future_video = future_video[:, target_indices].contiguous()
-
-        batch_size = generated_future_video.shape[0]
-        history_video = cond_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1).detach().float().cpu()
-        generated_future_video_bcthw = generated_future_video.permute(0, 2, 1, 3, 4).contiguous()
-        idm_clip, idm_meta = build_drivelaw_idm_clip(
-            history_video=history_video,
-            future_video=generated_future_video,
-            future_interval_s=self._trajectory_sampling.interval_length,
-        )
-
-        rollout.update({
-            "generated_future_video": generated_future_video,
-            "generated_future_video_bcthw": generated_future_video_bcthw,
-            "idm_clip": idm_clip,
-            "idm_meta": idm_meta,
-        })
-        return rollout
-
-    @torch.inference_mode()
-    def _decode_joint_future_target_latents(self, final_latents: torch.Tensor) -> torch.Tensor:
-        """Decode only the two temporally valid target latents from joint inference.
-
-        The joint model denoises six latent frames: four separately encoded
-        history-memory frames followed by two temporal target frames.  The
-        memory frames are transformer conditions, not a continuous temporal-VAE
-        clip, so decoding all six together produces an invalid 41-frame video.
-        The two target latents decode to the 2 Hz current-plus-eight-future
-        NAVSIM clip used by the RGB training loss.
-        """
-        if final_latents.ndim != 5 or final_latents.shape[2] < 2:
-            raise ValueError(
-                "Expected final joint latents shaped (B,C,F,H,W) with at least "
-                f"two target frames, got {tuple(final_latents.shape)}"
-            )
-
-        future_latents = final_latents[:, :, -2:].contiguous()
-        vae_dtype = next(self.vae.parameters()).dtype
-        mean = self.vae.latents_mean.to(
-            device=future_latents.device, dtype=vae_dtype
-        ).view(1, -1, 1, 1, 1)
-        std = self.vae.latents_std.to(
-            device=future_latents.device, dtype=vae_dtype
-        ).view(1, -1, 1, 1, 1)
-        vae_latents = future_latents.to(dtype=vae_dtype) * std + mean
-        decode_timestep = torch.zeros(
-            vae_latents.shape[0], device=vae_latents.device, dtype=vae_latents.dtype
-        )
-        decoded = self.vae.decode(
-            vae_latents, decode_timestep, return_dict=False
-        )[0].clamp(-1, 1)
-        decoded = self.pipe.video_processor.postprocess_video(decoded, output_type="pt")
-        if decoded.ndim != 5 or decoded.shape[1] != 9:
-            raise ValueError(
-                "Two target temporal latents must decode to a 9-frame clip, "
-                f"got {tuple(decoded.shape)}"
-            )
-        return decoded
-
-    @staticmethod
-    def _postprocess_action_outputs(actions: torch.Tensor) -> torch.Tensor:
-        actions = actions.clone()
-        actions.clamp_(-1.0, 1.0)
-        return denorm_odo(actions).detach().float().cpu()
-
-    @torch.inference_mode()
-    def sample_action_rollouts(
-        self,
-        features: Dict[str, torch.Tensor],
-        sample_time: int = 1,
-        seed: Optional[int] = None,
-    ) -> Dict[str, object]:
-        """Sample actions through the official cached-video-feature inference path."""
-        device = self.device
-        infer_inputs = self._prepare_joint_infer_inputs(features)
-        timing = infer_inputs["timing"]
-        generator_seed = infer_inputs["seed"] if seed is None else int(seed)
-        generator = torch.Generator(device=device).manual_seed(generator_seed)
-
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        out = self.pipe.infer(
-            conditions=[infer_inputs["condition"]],
-            prompt=infer_inputs["prompt"],
-            negative_prompt=infer_inputs["negative_prompt"],
-            num_inference_steps=infer_inputs["action_num_steps"],
-            action_num_inference_steps=infer_inputs["action_num_steps"],
-            guidance_scale=1.0,
-            height=infer_inputs["height"],
-            width=infer_inputs["width"],
-            generator=generator,
-            num_frames=infer_inputs["num_frames"],
-            frame_rate=infer_inputs["video_fps"],
-            num_videos_per_prompt=sample_time,
-            output_type="latent",
-            return_action=True,
-            return_video=False,
-            action_chunk=infer_inputs["action_chunk"],
-            action_dim=infer_inputs["action_dim"],
-            context_dict=infer_inputs["context_dict"],
-            noise_seed=generator_seed,
-            pixel_wise_timestep=True,
-            image_cond_noise_scale=0.0,
-        )
-        torch.cuda.synchronize()
-        timing["pipe_infer"] = time.perf_counter() - start
-
-        preds = out.frames if hasattr(out, "frames") else out
-        actions = self._postprocess_action_outputs(preds["actions"])
-        return {
-            "actions_tensor": actions,
-            "actions": actions.numpy(),
-            "timing": timing,
-        }
-
-    @torch.inference_mode()
-    def sample_joint_rollouts(
-        self,
-        features: Dict[str, torch.Tensor],
-        sample_time: int = 8,
-        seed: Optional[int] = None,
-        build_idm_clip: bool = False,
-        extract_future_video: bool = True,
-    ) -> Dict[str, object]:
-        """
-        Jointly sample `sample_time` action/video rollouts from the same conditioning input.
-
-        This is the GRPO-ready entry point for scheme A:
-          one pipe.infer call -> aligned actions and generated videos, with
-          optional IDM clip construction.
-        """
-        device = self.device
-        infer_inputs = self._prepare_joint_infer_inputs(features)
-        timing = infer_inputs["timing"]
-
-        generator_seed = infer_inputs["seed"] if seed is None else int(seed)
-        generator = torch.Generator(device=device).manual_seed(generator_seed)
-
+       
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         out = self.pipe.infer(
-            conditions=[infer_inputs["condition"]],
-            prompt=infer_inputs["prompt"],
-            negative_prompt=infer_inputs["negative_prompt"],
-            num_inference_steps=infer_inputs["video_num_steps"],
-            action_num_inference_steps=infer_inputs["action_num_steps"],
+            conditions=[condition],
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=10,
             guidance_scale=1.0,
-            height=infer_inputs["height"],
-            width=infer_inputs["width"],
+            height=height,
+            width=width,
             generator=generator,
-            num_frames=infer_inputs["num_frames"],
-            frame_rate=infer_inputs["video_fps"],
-            num_videos_per_prompt=sample_time,
-            output_type="final_latent",
+            num_frames=18,
+            output_type="latent", 
             return_action=True,
-            return_video=True,
-            action_chunk=infer_inputs["action_chunk"],
-            action_dim=infer_inputs["action_dim"],
-            context_dict=infer_inputs["context_dict"],
-            noise_seed=generator_seed,
+            return_video=False,
+            action_chunk=action_chunk,   
+            action_dim=action_dim,
+            context_dict=context_dict,
+            noise_seed=42,
             pixel_wise_timestep=True,
             image_cond_noise_scale=0.0,
-            freeze_action_video_features=bool(
-                getattr(self.args, "freeze_action_video_features", True)
-            ),
         )
         torch.cuda.synchronize()
-        timing["pipe_infer"] = time.perf_counter() - t1
+        timing['pipe_infer'] = time.perf_counter() - t1
 
+        
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
         preds = out.frames if hasattr(out, "frames") else out
-        if not isinstance(preds, dict) or "videos" not in preds:
-            raise TypeError("Joint pipeline must return action predictions and final video latents")
-        preds["videos"] = self._decode_joint_future_target_latents(preds["videos"])
-        rollout = self._postprocess_joint_rollout_outputs(
-            infer_inputs["cond_tensor"],
-            preds,
-            video_fps=infer_inputs["video_fps"],
-            # The decoded target clip begins with only the current anchor frame;
-            # the preceding four history latents were memory, not decoded frames.
-            condition_frames=1,
-            num_waypoints=infer_inputs["num_waypoints"],
-            waypoint_interval_s=infer_inputs["waypoint_interval_s"],
-            build_idm_clip=build_idm_clip,
-            extract_future_video=extract_future_video,
-        )
-        rollout["timing"] = timing
-        return rollout
+        actions = preds["actions"] if isinstance(preds, dict) else preds[0]["action"]  # (B, action_chunk, action_dim)
+        final_action_clip_value = 1.0
+        if final_action_clip_value is not None:
+            actions.clamp_(-final_action_clip_value, final_action_clip_value)
+        actions = denorm_odo(actions)
 
-    @torch.inference_mode()
-    def sample_joint_rollouts_batched(
-        self,
-        features: Dict[str, torch.Tensor],
-        sample_time: int = 8,
-        seed: Optional[int] = None,
-    ) -> Dict[str, object]:
-        """
-        Batched wrapper over `sample_joint_rollouts`.
-
-        Returns tensors flattened over `(batch, group)` so they can be passed
-        directly to GRPO reward consumers expecting `(B * G, ...)`.
-        """
-        if "images" not in features or not torch.is_tensor(features["images"]):
-            raise ValueError("Expected batched `features['images']` tensor.")
-
-        images = features["images"]
-        if images.ndim == 4:
-            rollout = self.sample_joint_rollouts(
-                features,
-                sample_time=sample_time,
-                seed=seed,
-                build_idm_clip=True,
-            )
-            rollout["batch_size"] = 1
-            rollout["group_size"] = sample_time
-            return rollout
-        if images.ndim != 5:
-            raise ValueError(f"Expected images shaped (B,T,C,H,W) or (T,C,H,W), got {tuple(images.shape)}")
-
-        batch_size = images.shape[0]
-        rollouts = []
-        for batch_index in range(batch_size):
-            single_features = self._slice_feature_sample(features, batch_index)
-            single_seed = None if seed is None else int(seed) + batch_index
-            rollouts.append(
-                self.sample_joint_rollouts(
-                    single_features,
-                    sample_time=sample_time,
-                    seed=single_seed,
-                    build_idm_clip=True,
-                )
-            )
-
-        merged: Dict[str, object] = {
-            "actions_tensor": torch.cat([r["actions_tensor"] for r in rollouts], dim=0),
-            "actions": np.concatenate([r["actions"] for r in rollouts], axis=0),
-            "decoded_video": torch.cat([r["decoded_video"] for r in rollouts], dim=0),
-            "generated_video": torch.cat([r["generated_video"] for r in rollouts], dim=0),
-            "generated_future_video": torch.cat([r["generated_future_video"] for r in rollouts], dim=0),
-            "generated_future_video_bcthw": torch.cat(
-                [r["generated_future_video_bcthw"] for r in rollouts], dim=0
-            ),
-            "idm_clip": torch.cat([r["idm_clip"] for r in rollouts], dim=0),
-            "idm_meta": rollouts[0]["idm_meta"],
-            "batch_size": batch_size,
-            "group_size": sample_time,
-            "timing": [r["timing"] for r in rollouts],
-        }
-        return merged
-
-    @torch.inference_mode()
-    def compute_idm_reward(
-        self,
-        idm_model: torch.nn.Module,
-        rollout: Dict[str, object],
-        lambda_pos: float = 1.0,
-        lambda_yaw: float = 0.2,
-        time_weights: Optional[torch.Tensor] = None,
-        reduction: str = "none",
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute Reward 2 from a joint rollout:
-          generated video -> IDM -> 8 waypoints -> align with sampled actions
-        """
-        idm_clip = rollout["idm_clip"]
-        idm_meta = rollout["idm_meta"]
-        sampled_waypoints = rollout["actions_tensor"]
-
-        if not torch.is_tensor(idm_clip) or not torch.is_tensor(sampled_waypoints):
-            raise TypeError("rollout must contain tensor entries `idm_clip` and `actions_tensor`")
-        if idm_meta.future_frames != sampled_waypoints.shape[1]:
-            raise ValueError(
-                "IDM future frame count must match sampled trajectory horizon, "
-                f"got {idm_meta.future_frames} vs {sampled_waypoints.shape[1]}"
-            )
-
-        device = self.device
-        idm_clip = idm_clip.to(device)
-        sampled_waypoints = sampled_waypoints.to(device)
-
-        pred_waypoints = idm_model(idm_clip, meta=idm_meta)
-        reward_dict = compute_idm_consistency_reward(
-            pred_waypoints=pred_waypoints,
-            sampled_waypoints=sampled_waypoints,
-            lambda_pos=lambda_pos,
-            lambda_yaw=lambda_yaw,
-            time_weights=time_weights,
-            reduction=reduction,
-        )
-        reward_dict["pred_waypoints"] = pred_waypoints
-        return reward_dict
-
-    @torch.inference_mode()
-    def compute_musiq_reward(
-        self,
-        rollout: Dict[str, object],
-        reduction: str = "none",
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute Reward 3 from a joint rollout:
-          generated future video -> MUSIQ(mid frame + last frame) / 2
-        """
-        future_video = rollout["generated_future_video"]
-        if not torch.is_tensor(future_video):
-            raise TypeError("rollout must contain tensor entry `generated_future_video`")
-
-        future_video = future_video.to(self.device)
-        return compute_musiq_reward(
-            future_video=future_video,
-            musiq_metric=self._get_musiq_metric(),
-            reduction=reduction,
-        )
-
-    @torch.inference_mode()
-    def compute_joint_reward_bundle(
-        self,
-        features: Dict[str, torch.Tensor],
-        idm_model: torch.nn.Module,
-        sample_time: int = 8,
-        seed: Optional[int] = None,
-        lambda_pos: float = 1.0,
-        lambda_yaw: float = 0.2,
-    ) -> Dict[str, object]:
-        """
-        High-level training entry helper:
-          batched features -> joint rollout -> Reward2/Reward3 tensors ready for GRPO.
-        """
-        rollout = self.sample_joint_rollouts_batched(
-            features=features,
-            sample_time=sample_time,
-            seed=seed,
-        )
-        idm_reward_dict = self.compute_idm_reward(
-            idm_model=idm_model,
-            rollout=rollout,
-            lambda_pos=lambda_pos,
-            lambda_yaw=lambda_yaw,
-            reduction="none",
-        )
-        musiq_reward_dict = self.compute_musiq_reward(
-            rollout=rollout,
-            reduction="none",
-        )
-        return {
-            "rollout": rollout,
-            "idm_reward_dict": idm_reward_dict,
-            "musiq_reward_dict": musiq_reward_dict,
-            "idm_rewards": idm_reward_dict["reward"],
-            "musiq_rewards": musiq_reward_dict["reward"],
-        }
-
-    @torch.inference_mode()
-    def forward_test(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        rollout = self.sample_joint_rollouts(features, sample_time=1)
-        self.last_inference_timing = rollout["timing"]
+        actions = actions[0].detach().float().cpu()  # (action_chunk, action_dim)
+        torch.cuda.synchronize()
+        timing['action_postprocessing'] = time.perf_counter() - t2
+        
+        
+        self.last_inference_timing = timing
+        
+        
         result: Dict[str, object] = {
-            "actions": rollout["actions"][0],
-            "actions_tensor": rollout["actions_tensor"][0],
-            "decoded_video": rollout["decoded_video"][0:1],
-            "generated_video": rollout["generated_video"][0:1],
-            "condition_pixel_frames": rollout["condition_pixel_frames"],
+            "actions": actions.numpy(),  
+            "actions_tensor": actions,   
         }
         return result
 

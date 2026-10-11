@@ -1,12 +1,9 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-from collections import Counter
-import json
 import logging
 import pickle
 import gzip
 import os
-import uuid
 
 import torch
 from tqdm import tqdm
@@ -15,32 +12,6 @@ from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 
 logger = logging.getLogger(__name__)
-
-CACHE_REPORTS_DIRNAME = "_cache_reports"
-
-
-def _collect_valid_cache_paths(
-    cache_path: Path,
-    feature_builders: List[AbstractFeatureBuilder],
-    target_builders: List[AbstractTargetBuilder],
-) -> Dict[str, Path]:
-    """Scan cache tree and return tokens with complete feature/target files."""
-    valid_cache_paths: Dict[str, Path] = {}
-
-    for log_path in cache_path.iterdir():
-        if not log_path.is_dir() or log_path.name == CACHE_REPORTS_DIRNAME:
-            continue
-        for token_path in log_path.iterdir():
-            if not token_path.is_dir():
-                continue
-            found_caches = [
-                (token_path / (builder.get_unique_name() + ".gz")).is_file()
-                for builder in feature_builders + target_builders
-            ]
-            if all(found_caches):
-                valid_cache_paths[token_path.name] = token_path
-
-    return valid_cache_paths
 
 
 def load_feature_target_from_pickle(path: Path) -> Dict[str, torch.Tensor]:
@@ -127,11 +98,7 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
 
         for log_name in tqdm(log_names, desc="Loading Valid Caches"):
             log_path = cache_path / log_name
-            if not log_path.is_dir():
-                continue
             for token_path in log_path.iterdir():
-                if not token_path.is_dir():
-                    continue
                 found_caches: List[bool] = []
                 for builder in feature_builders + target_builders:
                     data_dict_path = token_path / (builder.get_unique_name() + ".gz")
@@ -185,7 +152,6 @@ class Dataset(torch.utils.data.Dataset):
         self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
             self._cache_path, feature_builders, target_builders
         )
-        self.cache_stats: Dict[str, Any] = {}
 
         if self._cache_path is not None and not is_decoder:
             self.cache_dataset()
@@ -207,9 +173,14 @@ class Dataset(torch.utils.data.Dataset):
         valid_cache_paths: Dict[str, Path] = {}
 
         if (cache_path is not None) and cache_path.is_dir():
-            valid_cache_paths = _collect_valid_cache_paths(
-                cache_path, feature_builders, target_builders
-            )
+            for log_path in cache_path.iterdir():
+                for token_path in log_path.iterdir():
+                    found_caches: List[bool] = []
+                    for builder in feature_builders + target_builders:
+                        data_dict_path = token_path / (builder.get_unique_name() + ".gz")
+                        found_caches.append(data_dict_path.is_file())
+                    if all(found_caches):
+                        valid_cache_paths[token_path.name] = token_path
 
         return valid_cache_paths
     def load_token_cache(self, token: str) -> None:
@@ -288,61 +259,8 @@ class Dataset(torch.utils.data.Dataset):
                 """
             )
 
-        skipped_tokens = 0
-        skip_reasons: Counter = Counter()
-        skip_samples: List[Dict[str, str]] = []
-        quiet = os.environ.get("NAVSIM_CACHE_QUIET", "1") == "1"
-        log_every = int(os.environ.get("NAVSIM_CACHE_LOG_EVERY", "500"))
-
-        iterator = tqdm(tokens_to_cache, desc="Caching Dataset", disable=quiet)
-        for token in iterator:
-            try:
-                self._cache_scene_with_token(token)
-            except Exception as exc:
-                skipped_tokens += 1
-                reason = type(exc).__name__
-                skip_reasons[reason] += 1
-                if len(skip_samples) < 100:
-                    skip_samples.append(
-                        {"token": token, "error": reason, "message": str(exc)[:500]}
-                    )
-                if not quiet:
-                    logger.warning(
-                        "Skipping token %s due to cache error (%s): %s",
-                        token,
-                        reason,
-                        exc,
-                    )
-                elif skipped_tokens == 1 or skipped_tokens % log_every == 0:
-                    logger.info(
-                        "Cache skip progress: %d skipped so far (latest: %s, %s)",
-                        skipped_tokens,
-                        token,
-                        reason,
-                    )
-
-        cached_tokens = len(tokens_to_cache) - skipped_tokens
-        self.cache_stats = {
-            "succeeded": cached_tokens,
-            "skipped": skipped_tokens,
-            "total": len(tokens_to_cache),
-            "skip_reasons": dict(skip_reasons),
-            "skip_samples": skip_samples,
-            "worker_pid": os.getpid(),
-        }
-        reports_dir = self._cache_path / CACHE_REPORTS_DIRNAME
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path = reports_dir / f"cache_skip_report_{os.getpid()}_{uuid.uuid4().hex[:8]}.json"
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(self.cache_stats, f, indent=2)
-
-        logger.info(
-            "Caching finished: %d succeeded, %d skipped, %d total. Report: %s",
-            cached_tokens,
-            skipped_tokens,
-            len(tokens_to_cache),
-            report_path,
-        )
+        for token in tqdm(tokens_to_cache, desc="Caching Dataset"):
+            self._cache_scene_with_token(token)
 
     def __len__(self) -> None:
         """
